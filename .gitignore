@@ -1,0 +1,24 @@
+# --- build-artefacten ---
+*.obj
+*.exe
+*.res
+*.pdb
+*.ilk
+
+# --- persoonlijk / geheimen: NOOIT committen ---
+# TONE3000-tokens en API-key
+t3k.json
+# persoonlijke instellingen en presets
+settings.json
+presets.json
+# gedownloade community-content (eigen licenties, niet herdistribueren)
+models/
+irs/
+# productfoto (auteursrecht; alleen lokaal gebruik)
+native/assets/about.png
+
+# --- scratch ---
+third_party/NeuralAmpModelerCore/build_msvc/*.obj
+third_party/NeuralAmpModelerCore/build_msvc/*.exe
+
+imgui.ini
