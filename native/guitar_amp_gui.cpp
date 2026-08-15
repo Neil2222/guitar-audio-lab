@@ -1169,6 +1169,10 @@ struct T3KState {
     std::vector<T3KResult> results;
     std::mutex dlMu;               // register: tone-ID -> bestandsnaam
     std::map<long long, std::string> downloaded;
+    // paginering van de laatste zoekopdracht
+    std::atomic<int> curPage{1};
+    std::atomic<int> totalPages{1};
+    std::atomic<long long> totalTones{0};
     fs::path configFile;
 
     void save() {
@@ -1457,9 +1461,9 @@ static void t3kParseResults(const std::string& body) {
 }
 
 static void t3kSearchAsync(std::string query, std::string sort,
-                           std::string format = "nam") {
+                           std::string format = "nam", int page = 1) {
     if (t3k.busy.exchange(true)) return;
-    std::thread([query, sort, format] {
+    std::thread([query, sort, format, page] {
         std::string err;
         if (!t3kEnsureToken(err)) {
             g.setNetStatus("TONE3000: " + err);
@@ -1473,18 +1477,33 @@ static void t3kSearchAsync(std::string query, std::string sort,
             bearer = t3k.accessToken;
         }
         std::string q = "/api/v1/tones/search?format=" + formEncode(format) +
-                        "&sort=" + formEncode(sort);
+                        "&sort=" + formEncode(sort) +
+                        "&page=" + std::to_string(page) + "&page_size=25";
         if (!query.empty()) q += "&query=" + formEncode(query);
         std::wstring wq(q.begin(), q.end());
         std::string resp;
         if (httpRequestEx(T3K_HOST, wq, L"GET", "", bearer, resp, err)) {
             t3kParseResults(resp);
+            try {
+                auto j = nlohmann::json::parse(resp);
+                if (j.contains("page") && j["page"].is_number())
+                    t3k.curPage.store(j["page"].get<int>());
+                if (j.contains("total_pages") &&
+                    j["total_pages"].is_number())
+                    t3k.totalPages.store(j["total_pages"].get<int>());
+                if (j.contains("total") && j["total"].is_number())
+                    t3k.totalTones.store(j["total"].get<long long>());
+            } catch (...) {}
             size_t n;
             {
                 std::lock_guard<std::mutex> lk(t3k.resMu);
                 n = t3k.results.size();
             }
-            g.setNetStatus("TONE3000: " + std::to_string(n) + " resultaten");
+            g.setNetStatus(
+                "TONE3000: " + std::to_string(n) + " resultaten (pagina " +
+                std::to_string(t3k.curPage.load()) + "/" +
+                std::to_string(t3k.totalPages.load()) + ", " +
+                std::to_string(t3k.totalTones.load()) + " totaal)");
         } else {
             g.setNetStatus("TONE3000: zoeken mislukt: " + err);
         }
@@ -1574,6 +1593,22 @@ static void t3kDownloadAsync(long long toneId, std::string title,
             lowerStr(fname.substr(fname.size() - 4)) != ext)
             fname += ext;
         fs::path dest = destDir / fname;
+        // titels zijn niet uniek: bestaat het bestand al (andere tone met
+        // dezelfde naam), maak de naam uniek met het tone-ID
+        {
+            std::error_code ec;
+            bool ownFile = false;
+            {
+                std::lock_guard<std::mutex> lk(t3k.dlMu);
+                auto it = t3k.downloaded.find(toneId);
+                ownFile = it != t3k.downloaded.end() && it->second == fname;
+            }
+            if (fs::exists(dest, ec) && !ownFile) {
+                fname = fname.substr(0, fname.size() - 4) + " (t3k " +
+                        std::to_string(toneId) + ")" + ext;
+                dest = destDir / fname;
+            }
+        }
         FILE* f = _wfopen(dest.wstring().c_str(), L"wb");
         if (f) {
             fwrite(body.data(), 1, body.size(), f);
@@ -2054,6 +2089,7 @@ struct ModelEntry {
     std::wstring path;
     std::string label;  // UTF-8 voor ImGui
     int cat = 0;
+    long long mtime = 0;  // bestandsdatum = downloadmoment
 };
 
 static std::vector<ModelEntry> scanModels(const fs::path& dir) {
@@ -2062,7 +2098,11 @@ static std::vector<ModelEntry> scanModels(const fs::path& dir) {
     for (auto& e : fs::directory_iterator(dir, ec)) {
         if (e.path().extension() == L".nam") {
             std::string u8 = e.path().filename().string();
-            out.push_back({e.path().wstring(), u8, categorize(u8)});
+            std::error_code ec2;
+            auto ft = fs::last_write_time(e.path(), ec2);
+            long long mt =
+                ec2 ? 0 : (long long)ft.time_since_epoch().count();
+            out.push_back({e.path().wstring(), u8, categorize(u8), mt});
         }
     }
     return out;
@@ -2488,20 +2528,28 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
     struct IrEntry {
         std::wstring path;
         std::string label;
+        long long mtime = 0;
     };
     auto scanIrs = [&irsDir]() {
         std::vector<IrEntry> out;
         std::error_code ec;
         for (auto& e : fs::directory_iterator(irsDir, ec)) {
             auto ext = e.path().extension();
-            if (ext == L".wav" || ext == L".flac")
-                out.push_back(
-                    {e.path().wstring(), e.path().filename().string()});
+            if (ext == L".wav" || ext == L".flac") {
+                std::error_code ec2;
+                auto ft = fs::last_write_time(e.path(), ec2);
+                out.push_back({e.path().wstring(),
+                               e.path().filename().string(),
+                               ec2 ? 0
+                                   : (long long)ft.time_since_epoch()
+                                         .count()});
+            }
         }
         return out;
     };
     std::vector<IrEntry> irs = scanIrs();
-    int selIr = -1;  // -1 = geen IR
+    int selIr = -1;       // -1 = geen IR
+    int librarySort = 0;  // 0 = naam, 1 = nieuwste eerst
 
     // outputdevice-keuze + favorieten, persistentie in settings.json
     std::vector<OutDevice> outDevices = enumRenderDevices();
@@ -2530,10 +2578,54 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                 if (!savedIr.empty())
                     for (int i = 0; i < (int)irs.size(); i++)
                         if (irs[i].label == savedIr) selIr = i;
+                librarySort = j.value("library_sort", 0);
             } catch (...) {}
         }
     }
     if (selIr >= 0) loadIrAsync(irs[selIr].path);  // klaarzetten voor start
+
+    // sorteert modellen en IR's volgens librarySort; selecties blijven kloppen
+    auto applySort = [&] {
+        std::wstring keepM = (selModel >= 0 && selModel < (int)models.size())
+                                 ? models[selModel].path
+                                 : L"";
+        std::string keepI = (selIr >= 0 && selIr < (int)irs.size())
+                                ? irs[selIr].label
+                                : "";
+        if (librarySort == 1) {
+            std::sort(models.begin(), models.end(),
+                      [](const ModelEntry& a, const ModelEntry& b) {
+                          return a.mtime > b.mtime;
+                      });
+            std::sort(irs.begin(), irs.end(),
+                      [](const IrEntry& a, const IrEntry& b) {
+                          return a.mtime > b.mtime;
+                      });
+        } else {
+            std::sort(models.begin(), models.end(),
+                      [](const ModelEntry& a, const ModelEntry& b) {
+                          return lowerStr(a.label) < lowerStr(b.label);
+                      });
+            std::sort(irs.begin(), irs.end(),
+                      [](const IrEntry& a, const IrEntry& b) {
+                          return lowerStr(a.label) < lowerStr(b.label);
+                      });
+        }
+        if (!keepM.empty()) {
+            selModel = 0;
+            for (int i = 0; i < (int)models.size(); i++)
+                if (models[i].path == keepM) selModel = i;
+        }
+        if (!keepI.empty()) {
+            selIr = -1;
+            for (int i = 0; i < (int)irs.size(); i++)
+                if (irs[i].label == keepI) selIr = i;
+        }
+        browseSel = -1;
+        irBrowseSel = -1;
+    };
+    applySort();
+
     auto saveSettings = [&] {
         std::string id;
         if (selOut >= 0) {
@@ -2544,7 +2636,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
         for (auto& fv : favorites) favs.push_back(fv);
         nlohmann::json j = {{"output_device_id", id},
                             {"favorites", favs},
-                            {"ir", selIr >= 0 ? irs[selIr].label : ""}};
+                            {"ir", selIr >= 0 ? irs[selIr].label : ""},
+                            {"library_sort", librarySort}};
         FILE* f = _wfopen(settingsFile.wstring().c_str(), L"wb");
         if (f) {
             std::string s = j.dump(2);
@@ -3112,6 +3205,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
         if (ImGui::Button("Ververs")) {
             models = scanModels(modelsDir);
             if (selModel >= (int)models.size()) selModel = 0;
+            applySort();
         }
 
         // --- cabinet-IR ---
@@ -3160,6 +3254,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
         if (ImGui::Button("Ververs##ir")) {
             irs = scanIrs();
             if (selIr >= (int)irs.size()) selIr = -1;
+            applySort();
         }
 
         // --- start/stop ---
@@ -3332,9 +3427,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                            ImGui::GetStyle().ItemSpacing.x,
                        paneH),
                 ImGuiChildFlags_Borders);
-            ImGui::SetNextItemWidth(-1);
+            ImGui::SetNextItemWidth(-160);
             ImGui::InputTextWithHint("##libsearch", "zoeken...", libSearch,
                                      sizeof(libSearch));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            {
+                static const char* sortNames[] = {"Naam (A-Z)",
+                                                  "Nieuwste eerst"};
+                if (ImGui::Combo("##libsort", &librarySort, sortNames, 2)) {
+                    applySort();
+                    saveSettings();
+                }
+            }
             ImGui::BeginChild("modlist", ImVec2(0, 0), ImGuiChildFlags_None);
             // zoektermen (spatie-gescheiden) matchen op naam + metadata,
             // dus "fender clean" of "marshall crunch" werkt
@@ -3649,7 +3754,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                         selModel = 0;
                         for (int i = 0; i < (int)models.size(); i++)
                             if (models[i].path == keepPath) selModel = i;
-                        browseSel = -1;
+                        applySort();
                         saveSettings();
                         saveMeta();
                     } else if (delType == 2 && delIdx >= 0 &&
@@ -3666,6 +3771,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                             for (int i = 0; i < (int)irs.size(); i++)
                                 if (irs[i].label == activeLbl) selIr = i;
                         if (wasActive) loadIrAsync(L"");
+                        applySort();
                         irBrowseSel = -1;
                         saveSettings();
                     }
@@ -3773,19 +3879,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                         bool isIrMode = t3kFormat == 1;
                         const fs::path& dstDir =
                             isIrMode ? irsDir : modelsDir;
+                        // uitsluitend het tone-ID-register: titels zijn
+                        // niet uniek (meerdere tones kunnen "Acoustic
+                        // Guitar" heten)
                         bool have =
                             t3k.isDownloaded(res[i].toneId, dstDir);
-                        if (!have && !isIrMode) {
-                            // oudere downloads: herken op titel-prefix
-                            std::string pref =
-                                sanitizeFilename(res[i].title);
-                            for (auto& m : models)
-                                if (!pref.empty() &&
-                                    m.label.rfind(pref, 0) == 0) {
-                                    have = true;
-                                    break;
-                                }
-                        }
                         if (have) {
                             ImGui::TextDisabled("al binnen");
                         } else if (ImGui::SmallButton("ophalen") &&
@@ -3809,6 +3907,28 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                         ImGui::Text("%lld", res[i].favorites);
                     }
                     ImGui::EndTable();
+                }
+                // paginering
+                if (!res.empty()) {
+                    int cp = t3k.curPage.load();
+                    int tp = t3k.totalPages.load();
+                    bool busy = t3k.busy.load();
+                    if (cp <= 1 || busy) ImGui::BeginDisabled();
+                    if (ImGui::Button("< Vorige"))
+                        t3kSearchAsync(t3kQuery, sortKeys[t3kSort],
+                                       t3kFormat == 1 ? "ir" : "nam",
+                                       cp - 1);
+                    if (cp <= 1 || busy) ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::Text("pagina %d / %d  (%lld tones)", cp, tp,
+                                t3k.totalTones.load());
+                    ImGui::SameLine();
+                    if (cp >= tp || busy) ImGui::BeginDisabled();
+                    if (ImGui::Button("Volgende >"))
+                        t3kSearchAsync(t3kQuery, sortKeys[t3kSort],
+                                       t3kFormat == 1 ? "ir" : "nam",
+                                       cp + 1);
+                    if (cp >= tp || busy) ImGui::EndDisabled();
                 }
             }
             {
@@ -4012,6 +4132,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
             if (selModel >= (int)models.size()) selModel = 0;
             irs = scanIrs();
             if (selIr >= (int)irs.size()) selIr = -1;
+            applySort();
             ensureMeta();
             saveMeta();
         }
