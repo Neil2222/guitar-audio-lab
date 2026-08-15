@@ -1156,7 +1156,9 @@ static bool splitUrl(const std::string& url, std::wstring& host,
 struct T3KResult {
     long long toneId = 0;
     std::string title, creator, makes, tags;  // makes/tags komma-gescheiden
-    long long downloads = 0, favorites = 0;
+    std::string gear, desc;
+    bool verified = false;
+    long long downloads = 0, favorites = 0, modelsCount = 0;
 };
 
 struct T3KState {
@@ -1419,6 +1421,13 @@ static void t3kParseResults(const std::string& body) {
                                : "";
                 };
                 r.title = strF("title");
+                r.gear = strF("gear");
+                r.desc = strF("description");
+                if (t.contains("verified") && t["verified"].is_boolean())
+                    r.verified = t["verified"].get<bool>();
+                if (t.contains("models_count") &&
+                    t["models_count"].is_number())
+                    r.modelsCount = t["models_count"].get<long long>();
                 if (t.contains("downloads_count") &&
                     t["downloads_count"].is_number())
                     r.downloads = t["downloads_count"].get<long long>();
@@ -1461,9 +1470,10 @@ static void t3kParseResults(const std::string& body) {
 }
 
 static void t3kSearchAsync(std::string query, std::string sort,
-                           std::string format = "nam", int page = 1) {
+                           std::string format = "nam", int page = 1,
+                           std::string extra = "") {
     if (t3k.busy.exchange(true)) return;
-    std::thread([query, sort, format, page] {
+    std::thread([query, sort, format, page, extra] {
         std::string err;
         if (!t3kEnsureToken(err)) {
             g.setNetStatus("TONE3000: " + err);
@@ -1478,7 +1488,8 @@ static void t3kSearchAsync(std::string query, std::string sort,
         }
         std::string q = "/api/v1/tones/search?format=" + formEncode(format) +
                         "&sort=" + formEncode(sort) +
-                        "&page=" + std::to_string(page) + "&page_size=25";
+                        "&page=" + std::to_string(page) + "&page_size=25" +
+                        extra;
         if (!query.empty()) q += "&query=" + formEncode(query);
         std::wstring wq(q.begin(), q.end());
         std::string resp;
@@ -2512,6 +2523,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
     char t3kQuery[128] = "";
     int t3kSort = 0;
     int t3kFormat = 0;  // 0 = NAM, 1 = IR
+    int t3kGear = 0;    // 0 = alle types
+    bool t3kVerified = false, t3kCalibrated = false;
     t3k.configFile = modelsDir.parent_path() / L"t3k.json";
     t3k.load();
     {
@@ -3812,10 +3825,24 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                                              "IR's (cabinets)"};
                 static const char* sorts[] = {"meest gedownload",
                                               "beste match", "nieuwste",
-                                              "trending"};
+                                              "oudste", "trending"};
                 static const char* sortKeys[] = {"downloads-all-time",
                                                  "best-match", "newest",
-                                                 "trending"};
+                                                 "oldest", "trending"};
+                static const char* gearNames[] = {
+                    "alle types", "amp",      "amp + cab", "pedaal",
+                    "cab",        "outboard", "ruimte",    "experimenteel"};
+                static const char* gearKeys[] = {
+                    "",    "amp",      "amp-cab", "pedal",
+                    "cab", "outboard", "space",   "experimental"};
+                auto t3kExtra = [&]() -> std::string {
+                    std::string e;
+                    if (t3kGear > 0)
+                        e += std::string("&gears=") + gearKeys[t3kGear];
+                    if (t3kVerified) e += "&verified=true";
+                    if (t3kCalibrated) e += "&calibrated=true";
+                    return e;
+                };
                 auto redoSearch = [&] {
                     // oude resultaten horen bij het vorige formaat/sortering:
                     // direct legen (anders kloppen de "al binnen"-checks en
@@ -3826,7 +3853,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     }
                     if (!t3k.busy.load())
                         t3kSearchAsync(t3kQuery, sortKeys[t3kSort],
-                                       t3kFormat == 1 ? "ir" : "nam");
+                                       t3kFormat == 1 ? "ir" : "nam", 1,
+                                       t3kExtra());
                 };
                 ImGui::SetNextItemWidth(190);
                 ImGui::InputTextWithHint("##t3kq", "zoek (bv. plexi, metal)",
@@ -3837,12 +3865,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     redoSearch();
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(160);
-                if (ImGui::Combo("##t3ksort", &t3kSort, sorts, 4))
+                if (ImGui::Combo("##t3ksort", &t3kSort, sorts, 5))
                     redoSearch();
                 ImGui::SameLine();
                 if (ImGui::Button("Zoek") && !t3k.busy.load())
                     t3kSearchAsync(t3kQuery, sortKeys[t3kSort],
-                                   t3kFormat == 1 ? "ir" : "nam");
+                                   t3kFormat == 1 ? "ir" : "nam", 1,
+                                   t3kExtra());
                 ImGui::SameLine();
                 if (ImGui::SmallButton("verbreek")) {
                     std::lock_guard<std::mutex> lk(t3k.mu);
@@ -3852,6 +3881,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     t3k.connected.store(false);
                     t3k.save();
                 }
+                // filterregel (wijzigen = direct opnieuw zoeken)
+                ImGui::SetNextItemWidth(150);
+                if (ImGui::Combo("##t3kgear", &t3kGear, gearNames, 8))
+                    redoSearch();
+                ImGui::SameLine();
+                if (ImGui::Checkbox("geverifieerd", &t3kVerified))
+                    redoSearch();
+                ImGui::SameLine();
+                if (ImGui::Checkbox("gekalibreerd", &t3kCalibrated))
+                    redoSearch();
                 std::vector<T3KResult> res;
                 {
                     std::lock_guard<std::mutex> lk(t3k.resMu);
@@ -3861,16 +3900,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     ImGui::TextDisabled(
                         "nog geen resultaten - zoek hierboven");
                 } else if (ImGui::BeginTable(
-                               "t3kres", 5,
+                               "t3kres", 6,
                                ImGuiTableFlags_ScrollY |
                                    ImGuiTableFlags_RowBg |
                                    ImGuiTableFlags_BordersInnerV,
                                ImVec2(0, 230))) {
                     ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70.0f);
                     ImGui::TableSetupColumn("titel");
-                    ImGui::TableSetupColumn("maker", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-                    ImGui::TableSetupColumn("downloads", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-                    ImGui::TableSetupColumn("favs", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                    ImGui::TableSetupColumn("maker", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableSetupColumn("type", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                    ImGui::TableSetupColumn("downloads", ImGuiTableColumnFlags_WidthFixed, 85.0f);
+                    ImGui::TableSetupColumn("favs", ImGuiTableColumnFlags_WidthFixed, 55.0f);
                     ImGui::TableHeadersRow();
                     for (int i = 0; i < (int)res.size(); i++) {
                         ImGui::TableNextRow();
@@ -3895,15 +3935,42 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                         }
                         ImGui::PopID();
                         ImGui::TableSetColumnIndex(1);
+                        if (res[i].verified) {
+                            ImGui::TextColored(
+                                ImVec4(0.35f, 0.85f, 0.45f, 1.0f), "v");
+                            ImGui::SameLine();
+                        }
                         ImGui::TextUnformatted(res[i].title.c_str());
-                        if (!res[i].makes.empty() &&
-                            ImGui::IsItemHovered())
-                            ImGui::SetTooltip("%s", res[i].makes.c_str());
+                        if (ImGui::IsItemHovered()) {
+                            std::string tip;
+                            if (!res[i].makes.empty())
+                                tip += "Merk: " + res[i].makes;
+                            if (!res[i].tags.empty())
+                                tip += (tip.empty() ? "" : "\n") +
+                                       ("Tags: " + res[i].tags);
+                            if (res[i].modelsCount > 0)
+                                tip += (tip.empty() ? "" : "\n") +
+                                       ("Bestanden: " +
+                                        std::to_string(res[i].modelsCount));
+                            if (!res[i].desc.empty()) {
+                                std::string d = res[i].desc.substr(0, 300);
+                                tip += (tip.empty() ? "" : "\n\n") + d;
+                            }
+                            if (!tip.empty()) {
+                                ImGui::BeginTooltip();
+                                ImGui::PushTextWrapPos(420.0f);
+                                ImGui::TextUnformatted(tip.c_str());
+                                ImGui::PopTextWrapPos();
+                                ImGui::EndTooltip();
+                            }
+                        }
                         ImGui::TableSetColumnIndex(2);
                         ImGui::TextUnformatted(res[i].creator.c_str());
                         ImGui::TableSetColumnIndex(3);
-                        ImGui::Text("%lld", res[i].downloads);
+                        ImGui::TextDisabled("%s", res[i].gear.c_str());
                         ImGui::TableSetColumnIndex(4);
+                        ImGui::Text("%lld", res[i].downloads);
+                        ImGui::TableSetColumnIndex(5);
                         ImGui::Text("%lld", res[i].favorites);
                     }
                     ImGui::EndTable();
@@ -3917,7 +3984,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     if (ImGui::Button("< Vorige"))
                         t3kSearchAsync(t3kQuery, sortKeys[t3kSort],
                                        t3kFormat == 1 ? "ir" : "nam",
-                                       cp - 1);
+                                       cp - 1, t3kExtra());
                     if (cp <= 1 || busy) ImGui::EndDisabled();
                     ImGui::SameLine();
                     ImGui::Text("pagina %d / %d  (%lld tones)", cp, tp,
@@ -3927,7 +3994,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     if (ImGui::Button("Volgende >"))
                         t3kSearchAsync(t3kQuery, sortKeys[t3kSort],
                                        t3kFormat == 1 ? "ir" : "nam",
-                                       cp + 1);
+                                       cp + 1, t3kExtra());
                     if (cp >= tp || busy) ImGui::EndDisabled();
                 }
             }
