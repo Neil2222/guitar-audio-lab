@@ -3702,23 +3702,37 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                 if (ImGui::Button("Verbinden") && t3kKeyBuf[0])
                     t3kConnectAsync(t3kKeyBuf);
             } else {
-                ImGui::SetNextItemWidth(190);
-                ImGui::InputTextWithHint("##t3kq", "zoek (bv. plexi, metal)",
-                                         t3kQuery, sizeof(t3kQuery));
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(130);
                 static const char* fmts[] = {"NAM-modellen",
                                              "IR's (cabinets)"};
-                ImGui::Combo("##t3kfmt", &t3kFormat, fmts, 2);
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(160);
                 static const char* sorts[] = {"meest gedownload",
                                               "beste match", "nieuwste",
                                               "trending"};
                 static const char* sortKeys[] = {"downloads-all-time",
                                                  "best-match", "newest",
                                                  "trending"};
-                ImGui::Combo("##t3ksort", &t3kSort, sorts, 4);
+                auto redoSearch = [&] {
+                    // oude resultaten horen bij het vorige formaat/sortering:
+                    // direct legen (anders kloppen de "al binnen"-checks en
+                    // downloadbestemmingen niet) en opnieuw zoeken
+                    {
+                        std::lock_guard<std::mutex> lk(t3k.resMu);
+                        t3k.results.clear();
+                    }
+                    if (!t3k.busy.load())
+                        t3kSearchAsync(t3kQuery, sortKeys[t3kSort],
+                                       t3kFormat == 1 ? "ir" : "nam");
+                };
+                ImGui::SetNextItemWidth(190);
+                ImGui::InputTextWithHint("##t3kq", "zoek (bv. plexi, metal)",
+                                         t3kQuery, sizeof(t3kQuery));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(130);
+                if (ImGui::Combo("##t3kfmt", &t3kFormat, fmts, 2))
+                    redoSearch();
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(160);
+                if (ImGui::Combo("##t3ksort", &t3kSort, sorts, 4))
+                    redoSearch();
                 ImGui::SameLine();
                 if (ImGui::Button("Zoek") && !t3k.busy.load())
                     t3kSearchAsync(t3kQuery, sortKeys[t3kSort],
