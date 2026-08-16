@@ -102,6 +102,7 @@ struct EngineShared {
     std::atomic<long> underruns{0};
     std::atomic<long> driftCorr{0};
     std::atomic<long> lateWakeups{0};
+    std::atomic<long> wakeupsStat{0};  // levende teller = capture leeft
     std::atomic<double> modelSR{0.0};
     // naadloze modelwissel: loader-thread zet het nieuwe model klaar in
     // pendingModel; de engine pikt het op blokgrens op en parkeert het oude
@@ -144,6 +145,31 @@ struct EngineShared {
 
     // outputmodus van de draaiende engine (exclusive of shared-fallback)
     std::atomic<bool> outShared{false};
+
+    // systeemaudio: Windows-audio (Spotify/YouTube) via WASAPI-loopback op
+    // een twééde endpoint, terwijl de engine exclusive op de output blijft.
+    // De capture-thread schrijft 48k stereo interleaved in een lock-vrije
+    // ring; de engine-thread mixt met eigen leesteller + driftcorrectie.
+    static const uint32_t SRING = 65536;  // frames (~1,4 s)
+    float sring[SRING * 2] = {};
+    std::atomic<uint32_t> sringW{0};      // vrijlopende frame-teller
+    std::atomic<bool> sysActive{false};   // capture draait en levert data
+    std::atomic<bool> sysMuted{false};
+    std::atomic<float> sysVol{0.7f};
+    std::atomic<int> sysFillMs{0};        // engine -> UI: bufferstand
+    std::atomic<float> sysCapPeak{0.0f};  // capture -> UI: signaaldetectie
+    std::atomic<float> sysMixPeak{0.0f};  // engine -> UI: muziek echt gemixt
+    std::mutex sysStatusMutex;
+    std::string sysStatus;
+
+    void setSysStatus(const std::string& s) {
+        std::lock_guard<std::mutex> lk(sysStatusMutex);
+        sysStatus = s;
+    }
+    std::string getSysStatus() {
+        std::lock_guard<std::mutex> lk(sysStatusMutex);
+        return sysStatus;
+    }
 
     // online modellencatalogus + downloadstatus
     std::mutex catMutex;
@@ -293,7 +319,8 @@ struct Biquad {
         goto cleanup;                                       \
     } while (0)
 
-static void engineMain(std::wstring modelPath, std::wstring outDevId) {
+static void engineMain(std::wstring modelPath, std::wstring outDevId,
+                       int renderDelayMs) {
     const int MAXBLOCK = 2048;
 
     IMMDeviceEnumerator* enu = nullptr;
@@ -388,6 +415,72 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId) {
         hr = capClient->GetService(__uuidof(IAudioCaptureClient), (void**)&cap);
         if (FAILED(hr)) ENG_FAIL("GetService capture");
 
+        // verse systeemaudio-sessie: spelende streams (Chrome hanteert ~2 s
+        // debounce op default-wissels) eerst naadloos laten wegmigreren van
+        // de output vóórdat we claimen — zo wordt er niets gekickt en blijft
+        // YouTube gewoon doorspelen
+        for (int waited = 0; waited < renderDelayMs; waited += 100) {
+            if (g.stopRequested.load(std::memory_order_relaxed))
+                goto cleanup;
+            Sleep(100);
+        }
+        // wake-claim (fase 7 v1.5, gemeten met de Snowball-mic-probe): na
+        // minuten audio-stilte suspendt de Realtek-USB-codec, en de EERSTE
+        // exclusive stream daarna speelt ONHOORBAAR (padding/stats normaal,
+        // geen geluid) — hij wekt alleen de hardware; de volgende stream is
+        // wél hoorbaar. Dus: altijd eerst een korte wegwerp-claim met heel
+        // zachte toon (-60 dB; digitaal niet-stil, anders negeert de
+        // idle-detectie hem), sluiten, en dan pas de echte claim.
+        {
+            IAudioClient* wake = nullptr;
+            hr = outDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
+                                  nullptr, (void**)&wake);
+            WAVEFORMATEXTENSIBLE wf = pcm16(2);
+            if (SUCCEEDED(hr))
+                hr = wake->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 200000,
+                                      0, (WAVEFORMATEX*)&wf, nullptr);
+            for (int retry = 0; hr == AUDCLNT_E_DEVICE_IN_USE && retry < 15;
+                 retry++) {
+                Sleep(200);
+                wake->Release();
+                wake = nullptr;
+                hr = outDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
+                                      nullptr, (void**)&wake);
+                if (FAILED(hr)) break;
+                hr = wake->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 200000,
+                                      0, (WAVEFORMATEX*)&wf, nullptr);
+            }
+            if (SUCCEEDED(hr)) {
+                IAudioRenderClient* wr = nullptr;
+                if (SUCCEEDED(wake->GetService(__uuidof(IAudioRenderClient),
+                                               (void**)&wr))) {
+                    UINT32 wb = 0;
+                    wake->GetBufferSize(&wb);
+                    BYTE* pb = nullptr;
+                    if (SUCCEEDED(wr->GetBuffer(wb, &pb))) {
+                        int16_t* s = (int16_t*)pb;
+                        double ph = 0.0;
+                        for (UINT32 i = 0; i < wb; i++) {
+                            int16_t v = (int16_t)(sin(ph) * 0.001 * 32767);
+                            ph += 2.0 * 3.14159265358979 * 520.0 / SR;
+                            s[2 * i] = v;
+                            s[2 * i + 1] = v;
+                        }
+                        wr->ReleaseBuffer(wb, 0);
+                    }
+                    wake->Start();
+                    Sleep(400);
+                    wake->Stop();
+                    wr->Release();
+                }
+                wake->Release();
+                Sleep(100);  // release laten bezinken vóór de echte claim
+            } else if (wake) {
+                wake->Release();  // wake mislukt (bv. bezet): gewoon door
+            }
+            hr = S_OK;
+        }
+
         // --- render (polling) ---
         hr = outDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                               (void**)&renClient);
@@ -396,7 +489,9 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId) {
         bool sharedOut = false;
         hr = renClient->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 200000, 0,
                                    (WAVEFORMATEX*)&outFmt, nullptr);
-        for (int retry = 0; hr == AUDCLNT_E_DEVICE_IN_USE && retry < 5;
+        // ruime retry: een net weg-migrerende mediastream kan het device
+        // nog even bezet houden
+        for (int retry = 0; hr == AUDCLNT_E_DEVICE_IN_USE && retry < 15;
              retry++) {
             Sleep(200);
             renClient->Release();
@@ -452,6 +547,11 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId) {
         std::vector<float> fOut(MAXBLOCK);
         std::unique_ptr<PlayerTrack> track;
         size_t tpos = 0;
+        // systeemaudio: eigen leesteller op g.sring + zachte driftcorrectie
+        uint32_t sysR = 0;
+        bool sysPrimed = false;
+        long sysFillAcc = 0;
+        int sysFillN = 0;
         std::unique_ptr<IrData> ir;
         std::vector<float> irTail, irCtx;  // convolutie-context
         Biquad eqB, eqM, eqT;
@@ -649,8 +749,7 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId) {
                 if (a > pkOut) pkOut = a;
                 fOut[i] = v;
             }
-            if (pkOut > g.peakOut.load(std::memory_order_relaxed))
-                g.peakOut.store(pkOut, std::memory_order_relaxed);
+            (void)pkOut;  // out-meter meet nu de eindmix (in de schrijflus)
 
             UINT32 padding = 0;
             if (FAILED(renClient->GetCurrentPadding(&padding))) continue;
@@ -664,6 +763,7 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId) {
                     g.padAvgFrames.store((int)(padAcc / accN));
                     g.dspAvgUs.store((int)(dspAcc / accN * 1000.0));
                     g.dspMaxUs.store((int)(dspMax * 1000.0));
+                    g.wakeupsStat.store(wakeups);
                     padAcc = dspAcc = 0.0;
                     accN = 0;
                 }
@@ -696,6 +796,40 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId) {
             const float tVol = g.playerVol.load(std::memory_order_relaxed);
             const float* tp = track ? track->pcm.data() : nullptr;
             const size_t tFrames = track ? track->frames : 0;
+            // systeemaudio: bufferstand bepalen; muziek volgt de renderklok
+            // (consumptie = n frames per blok), de capture volgt de klok van
+            // het muziek-endpoint -> driftcorrectie van max 1 frame per blok
+            const bool sysOn = g.sysActive.load(std::memory_order_relaxed);
+            const bool sysMut = g.sysMuted.load(std::memory_order_relaxed);
+            const float sysV = g.sysVol.load(std::memory_order_relaxed);
+            uint32_t sysAvail = 0;
+            if (sysOn) {
+                const uint32_t PREFILL = 2400;  // ~50 ms muziekbuffer
+                uint32_t w = g.sringW.load(std::memory_order_acquire);
+                uint32_t sfill = w - sysR;
+                if (!sysPrimed || sfill > EngineShared::SRING - 4800) {
+                    sysR = w - (PREFILL < w ? PREFILL : w);  // (her)sync
+                    sysPrimed = true;
+                    sfill = w - sysR;
+                } else if (sfill > PREFILL + 480) {
+                    sysR++;  // muziekklok loopt voor: 1 frame droppen
+                    sfill--;
+                } else if (sfill < PREFILL - 480 && sfill > n) {
+                    sysR--;  // loopt achter: 1 frame herhalen
+                    sfill++;
+                }
+                sysAvail = sfill;
+                sysFillAcc += (long)sfill;
+                if (++sysFillN >= 100) {
+                    g.sysFillMs.store(
+                        (int)(sysFillAcc / sysFillN * 1000.0 / SR));
+                    sysFillAcc = 0;
+                    sysFillN = 0;
+                }
+            } else {
+                sysPrimed = false;
+            }
+            const uint32_t SMASK = EngineShared::SRING - 1;
             for (UINT32 i = 0; i < n; i++) {
                 float gv = i < writeN ? fOut[writeOfs + i] : lastS;
                 float L = gv, R = gv;
@@ -704,16 +838,34 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId) {
                     R += tp[tpos * 2 + 1] * tVol;
                     tpos++;
                 }
+                if (sysOn && !sysMut && i < sysAvail) {
+                    uint32_t si = (sysR + i) & SMASK;
+                    float mL = g.sring[si * 2] * sysV;
+                    float mR = g.sring[si * 2 + 1] * sysV;
+                    L += mL;
+                    R += mR;
+                    float ma = fabsf(mL) > fabsf(mR) ? fabsf(mL) : fabsf(mR);
+                    if (ma > g.sysMixPeak.load(std::memory_order_relaxed))
+                        g.sysMixPeak.store(ma, std::memory_order_relaxed);
+                }
                 auto clip = [](float v) {
                     if (v > 0.8f) v = 0.8f + 0.2f * tanhf((v - 0.8f) / 0.2f);
                     else if (v < -0.8f)
                         v = -0.8f - 0.2f * tanhf((-v - 0.8f) / 0.2f);
                     return v;
                 };
-                o[i * 2] = (int16_t)lrintf(clip(L) * 32767.0f);
-                o[i * 2 + 1] = (int16_t)lrintf(clip(R) * 32767.0f);
+                float outL = clip(L), outR = clip(R);
+                // eindmix-meter: wat er ECHT naar het device gaat
+                float oa = fabsf(outL) > fabsf(outR) ? fabsf(outL)
+                                                     : fabsf(outR);
+                if (oa > g.peakOut.load(std::memory_order_relaxed))
+                    g.peakOut.store(oa, std::memory_order_relaxed);
+                o[i * 2] = (int16_t)lrintf(outL * 32767.0f);
+                o[i * 2 + 1] = (int16_t)lrintf(outR * 32767.0f);
             }
             ren->ReleaseBuffer(n, 0);
+            // ook bij mute consumeren, zodat de muziek "doorloopt"
+            if (sysOn) sysR += n < sysAvail ? n : sysAvail;
             if (track) {
                 if (tPlay && tpos >= tFrames) {
                     if (g.playerLoop.load(std::memory_order_relaxed)) tpos = 0;
@@ -779,14 +931,379 @@ static void stopEngine() {
 }
 
 static void startEngine(const std::wstring& modelPath,
-                        const std::wstring& outDevId) {
+                        const std::wstring& outDevId,
+                        int renderDelayMs = 0) {
     stopEngine();
     g.setError("");
     g.underruns = 0;
     g.driftCorr = 0;
     g.lateWakeups = 0;
     g.dspMaxUs = 0;
-    gEngineThread = std::thread(engineMain, modelPath, outDevId);
+    gEngineThread = std::thread(engineMain, modelPath, outDevId,
+                                renderDelayMs);
+}
+
+// ============================================================= systeemaudio
+// Windows-audio meemixen: het Windows-default-device wordt tijdelijk op een
+// tweede endpoint (bv. HDMI-monitor) gezet, dat endpoint wordt gemute
+// (fase 6-meting: mute dempt het loopbacksignaal NIET, volume wel) en via
+// WASAPI-loopback gecaptured. Een stille shared renderer houdt de loopback
+// aan de praat (zonder renderer levert die 0 frames).
+
+// IPolicyConfig: ongedocumenteerd maar de-facto stabiel (SoundSwitch e.d.)
+// voor het programmatisch omzetten van het default-device.
+struct DeviceShareMode;
+struct __declspec(uuid("f8679f50-850a-41cf-9c72-430f290290c8"))
+    IPolicyConfig : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetMixFormat(PCWSTR, WAVEFORMATEX**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDeviceFormat(PCWSTR, INT,
+                                                      WAVEFORMATEX**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ResetDeviceFormat(PCWSTR) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDeviceFormat(PCWSTR, WAVEFORMATEX*,
+                                                      WAVEFORMATEX*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetProcessingPeriod(PCWSTR, INT, PINT64,
+                                                          PINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetProcessingPeriod(PCWSTR, PINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetShareMode(PCWSTR,
+                                                   DeviceShareMode*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetShareMode(PCWSTR,
+                                                   DeviceShareMode*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PCWSTR, INT,
+                                                       const PROPERTYKEY&,
+                                                       PROPVARIANT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetPropertyValue(PCWSTR, INT,
+                                                       const PROPERTYKEY&,
+                                                       PROPVARIANT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDefaultEndpoint(PCWSTR, ERole) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetEndpointVisibility(PCWSTR, INT) = 0;
+};
+class __declspec(uuid("870af99c-171d-4f9e-af0d-e63df40c2bc9"))
+    CPolicyConfigClient;
+
+static HRESULT setDefaultEndpoint(const std::wstring& id) {
+    IPolicyConfig* pc = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(CPolicyConfigClient), nullptr,
+                                  CLSCTX_ALL, __uuidof(IPolicyConfig),
+                                  (void**)&pc);
+    if (FAILED(hr)) return hr;
+    hr = pc->SetDefaultEndpoint(id.c_str(), eConsole);
+    if (SUCCEEDED(hr)) hr = pc->SetDefaultEndpoint(id.c_str(), eMultimedia);
+    if (SUCCEEDED(hr)) pc->SetDefaultEndpoint(id.c_str(), eCommunications);
+    pc->Release();
+    return hr;
+}
+
+static std::wstring getDefaultRenderId() {
+    std::wstring out;
+    IMMDeviceEnumerator* enu = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                   CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                   (void**)&enu))) {
+        IMMDevice* dev = nullptr;
+        if (SUCCEEDED(enu->GetDefaultAudioEndpoint(eRender, eMultimedia,
+                                                   &dev))) {
+            LPWSTR id = nullptr;
+            if (SUCCEEDED(dev->GetId(&id))) {
+                out = id;
+                CoTaskMemFree(id);
+            }
+            dev->Release();
+        }
+        enu->Release();
+    }
+    return out;
+}
+
+// bewaarde toestand om bij uitschakelen/afsluiten netjes te herstellen
+static std::thread gSysThread;
+static std::atomic<bool> gSysStop{false};
+static std::atomic<bool> gSysDone{false};  // thread is (voortijdig) gestopt
+static std::wstring gSysDevId;             // actief muziek-endpoint
+static std::wstring gSysPrevDefault;
+static bool gSysSwitchedDefault = false;
+static float gSysPrevVol = 1.0f;
+static BOOL gSysPrevMute = FALSE;
+static bool gSysVolSaved = false;
+
+#define SYS_FAIL(msg)                     \
+    do {                                  \
+        g.setSysStatus(msg);              \
+        goto cleanup;                     \
+    } while (0)
+
+static void sysCaptureMain(std::wstring devId) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator* enu = nullptr;
+    IMMDevice* dev = nullptr;
+    IAudioClient *lb = nullptr, *sil = nullptr;
+    IAudioCaptureClient* cap = nullptr;
+    IAudioRenderClient* silRen = nullptr;
+    WAVEFORMATEX* mix = nullptr;
+    UINT32 silBuf = 0;
+    UINT32 srcRate = 0, srcCh = 0;
+    // lineaire resampler-state (alleen gebruikt als bronrate != 48 kHz)
+    double phase = 0.0;
+    float prevL = 0.0f, prevR = 0.0f;
+    bool havePrev = false;
+    HRESULT hr = S_OK;
+
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          __uuidof(IMMDeviceEnumerator), (void**)&enu);
+    if (FAILED(hr)) SYS_FAIL("systeemaudio: enumerator faalde");
+    hr = enu->GetDevice(devId.c_str(), &dev);
+    if (FAILED(hr) || !dev) SYS_FAIL("systeemaudio: endpoint niet gevonden");
+
+    // loopback-capture in het mix-format van het endpoint
+    hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                       (void**)&lb);
+    if (FAILED(hr)) SYS_FAIL("systeemaudio: Activate loopback faalde");
+    lb->GetMixFormat(&mix);
+    if (!mix || mix->wBitsPerSample != 32)
+        SYS_FAIL("systeemaudio: onverwacht mix-format (geen float32)");
+    srcRate = mix->nSamplesPerSec;
+    srcCh = mix->nChannels;
+    hr = lb->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                        1000000 /* 100 ms */, 0, mix, nullptr);
+    if (FAILED(hr)) SYS_FAIL("systeemaudio: loopback-init faalde");
+    hr = lb->GetService(__uuidof(IAudioCaptureClient), (void**)&cap);
+    if (FAILED(hr)) SYS_FAIL("systeemaudio: capture-service faalde");
+
+    // stille renderer: zonder actieve render-stream levert loopback niets
+    {
+        hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                           (void**)&sil);
+        if (FAILED(hr)) SYS_FAIL("systeemaudio: Activate renderer faalde");
+        WAVEFORMATEXTENSIBLE sfmt = pcm16(2);
+        hr = sil->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                 AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                             1000000, 0, (WAVEFORMATEX*)&sfmt, nullptr);
+        if (FAILED(hr)) SYS_FAIL("systeemaudio: stille renderer faalde");
+        sil->GetBufferSize(&silBuf);
+        hr = sil->GetService(__uuidof(IAudioRenderClient), (void**)&silRen);
+        if (FAILED(hr)) SYS_FAIL("systeemaudio: render-service faalde");
+        BYTE* pb = nullptr;
+        if (SUCCEEDED(silRen->GetBuffer(silBuf / 2, &pb))) {
+            memset(pb, 0, (size_t)(silBuf / 2) * 4);
+            silRen->ReleaseBuffer(silBuf / 2, 0);
+        }
+        sil->Start();
+    }
+    lb->Start();
+    g.sysActive.store(true);
+    g.setSysStatus("");
+
+    while (!gSysStop.load(std::memory_order_relaxed)) {
+        Sleep(4);
+        // stille renderer bijvullen tot de helft
+        {
+            UINT32 pad = 0;
+            hr = sil->GetCurrentPadding(&pad);
+            if (FAILED(hr)) break;
+            if (pad < silBuf / 2) {
+                UINT32 need = silBuf / 2 - pad;
+                BYTE* pb = nullptr;
+                if (SUCCEEDED(silRen->GetBuffer(need, &pb))) {
+                    memset(pb, 0, (size_t)need * 4);
+                    silRen->ReleaseBuffer(need, 0);
+                }
+            }
+        }
+        // loopback-packets naar de ring (10 ms-porties)
+        float batchPeak = 0.0f;
+        for (;;) {
+            BYTE* data = nullptr;
+            UINT32 frames = 0;
+            DWORD flags = 0;
+            HRESULT h = cap->GetBuffer(&data, &frames, &flags, nullptr,
+                                       nullptr);
+            if (h == AUDCLNT_S_BUFFER_EMPTY) break;
+            if (FAILED(h)) {
+                hr = h;
+                goto looped;
+            }
+            const float* f = (const float*)data;
+            const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+            if (!silent)
+                for (UINT32 i = 0; i < frames * srcCh; i++) {
+                    float a = fabsf(f[i]);
+                    if (a > batchPeak) batchPeak = a;
+                }
+            uint32_t w = g.sringW.load(std::memory_order_relaxed);
+            const uint32_t MASK = EngineShared::SRING - 1;
+            if (srcRate == SR) {
+                for (UINT32 i = 0; i < frames; i++) {
+                    float L = 0.0f, R = 0.0f;
+                    if (!silent) {
+                        L = f[i * srcCh];
+                        R = srcCh > 1 ? f[i * srcCh + 1] : L;
+                    }
+                    g.sring[(w & MASK) * 2] = L;
+                    g.sring[(w & MASK) * 2 + 1] = R;
+                    w++;
+                }
+            } else {
+                // lineair naar 48 kHz (alleen bij afwijkende bronrate)
+                const double step = (double)srcRate / SR;
+                for (UINT32 i = 0; i < frames; i++) {
+                    float cl = 0.0f, cr = 0.0f;
+                    if (!silent) {
+                        cl = f[i * srcCh];
+                        cr = srcCh > 1 ? f[i * srcCh + 1] : cl;
+                    }
+                    if (!havePrev) {
+                        prevL = cl;
+                        prevR = cr;
+                        havePrev = true;
+                        continue;
+                    }
+                    while (phase < 1.0) {
+                        float t = (float)phase;
+                        g.sring[(w & MASK) * 2] = prevL + t * (cl - prevL);
+                        g.sring[(w & MASK) * 2 + 1] = prevR + t * (cr - prevR);
+                        w++;
+                        phase += step;
+                    }
+                    phase -= 1.0;
+                    prevL = cl;
+                    prevR = cr;
+                }
+            }
+            g.sringW.store(w, std::memory_order_release);
+            cap->ReleaseBuffer(frames);
+        }
+        // signaaldetectie voor de UI (langzaam wegzakkende peak)
+        {
+            float cur = g.sysCapPeak.load(std::memory_order_relaxed);
+            float np = batchPeak > cur ? batchPeak : cur * 0.995f;
+            g.sysCapPeak.store(np, std::memory_order_relaxed);
+        }
+    }
+looped:
+    if (FAILED(hr))
+        g.setSysStatus(hr == AUDCLNT_E_DEVICE_INVALIDATED
+                           ? "muziek-endpoint weggevallen (monitor uit?)"
+                           : "systeemaudio: capture-fout");
+cleanup:
+    g.sysActive.store(false);
+    if (lb) lb->Stop();
+    if (sil) sil->Stop();
+    if (cap) cap->Release();
+    if (silRen) silRen->Release();
+    if (lb) lb->Release();
+    if (sil) sil->Release();
+    if (mix) CoTaskMemFree(mix);
+    if (dev) dev->Release();
+    if (enu) enu->Release();
+    CoUninitialize();
+    gSysDone.store(true);
+}
+
+// endpoint stil maken maar loopback op vol niveau: volume 100% + mute
+// (fase 6-meting: mute dempt loopback niet, volume wel); bewaart de oude stand
+static void sysSaveAndMuteEndpoint(const std::wstring& devId) {
+    gSysVolSaved = false;
+    IMMDeviceEnumerator* enu = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                   CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                   (void**)&enu))) {
+        IMMDevice* dev = nullptr;
+        if (SUCCEEDED(enu->GetDevice(devId.c_str(), &dev))) {
+            IAudioEndpointVolume* v = nullptr;
+            if (SUCCEEDED(dev->Activate(__uuidof(IAudioEndpointVolume),
+                                        CLSCTX_ALL, nullptr, (void**)&v))) {
+                v->GetMasterVolumeLevelScalar(&gSysPrevVol);
+                v->GetMute(&gSysPrevMute);
+                gSysVolSaved = true;
+                v->SetMasterVolumeLevelScalar(1.0f, nullptr);
+                v->SetMute(TRUE, nullptr);
+                v->Release();
+            }
+            dev->Release();
+        }
+        enu->Release();
+    }
+}
+
+static void sysRestoreEndpointState() {
+    if (!gSysVolSaved) return;
+    IMMDeviceEnumerator* enu = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                   CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                   (void**)&enu))) {
+        IMMDevice* dev = nullptr;
+        if (SUCCEEDED(enu->GetDevice(gSysDevId.c_str(), &dev))) {
+            IAudioEndpointVolume* v = nullptr;
+            if (SUCCEEDED(dev->Activate(__uuidof(IAudioEndpointVolume),
+                                        CLSCTX_ALL, nullptr, (void**)&v))) {
+                v->SetMasterVolumeLevelScalar(gSysPrevVol, nullptr);
+                v->SetMute(gSysPrevMute, nullptr);
+                v->Release();
+            }
+            dev->Release();
+        }
+        enu->Release();
+    }
+    gSysVolSaved = false;
+}
+
+// UI-thread: capture starten + default-device en mute-status omzetten
+static void startSysAudio(const std::wstring& devId) {
+    if (gSysThread.joinable()) return;
+    gSysDevId = devId;
+    g.setSysStatus("");
+    g.sysCapPeak.store(0.0f);
+    // default-device omzetten zodat Spotify/YouTube op dit endpoint spelen
+    gSysPrevDefault = getDefaultRenderId();
+    gSysSwitchedDefault = false;
+    if (gSysPrevDefault != devId) {
+        if (SUCCEEDED(setDefaultEndpoint(devId)))
+            gSysSwitchedDefault = true;
+        else
+            g.setSysStatus("kon default-device niet omzetten; zet het "
+                           "handmatig op het muziek-endpoint");
+    }
+    sysSaveAndMuteEndpoint(devId);
+    gSysStop.store(false);
+    gSysDone.store(false);
+    gSysThread = std::thread(sysCaptureMain, devId);
+}
+
+static void stopSysAudio() {
+    if (gSysThread.joinable()) {
+        gSysStop.store(true);
+        gSysThread.join();
+    }
+    sysRestoreEndpointState();
+    // default-device terugzetten
+    if (gSysSwitchedDefault && !gSysPrevDefault.empty())
+        setDefaultEndpoint(gSysPrevDefault);
+    gSysSwitchedDefault = false;
+    gSysDone.store(false);
+}
+
+// ander muziek-endpoint kiezen TERWIJL systeemaudio actief is. Belangrijk:
+// de default gaat rechtstreeks oud -> nieuw, zonder tussenstap via het
+// oorspronkelijke default (dat is meestal de exclusief bezette
+// engine-output; een mediastream die daarheen probeert te verhuizen
+// sterft en blijft stil tot de gebruiker pauzeert/hervat)
+static void retargetSysAudio(const std::wstring& newId) {
+    if (!gSysThread.joinable()) {
+        startSysAudio(newId);
+        return;
+    }
+    gSysStop.store(true);
+    gSysThread.join();
+    sysRestoreEndpointState();  // oude endpoint: volume/mute terug
+    if (SUCCEEDED(setDefaultEndpoint(newId)))
+        gSysSwitchedDefault = true;
+    gSysDevId = newId;
+    g.setSysStatus("");
+    g.sysCapPeak.store(0.0f);
+    sysSaveAndMuteEndpoint(newId);
+    gSysStop.store(false);
+    gSysDone.store(false);
+    gSysThread = std::thread(sysCaptureMain, newId);
 }
 
 // ============================================================= modellenshop
@@ -2511,6 +3028,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
     float uiPeakIn = 0.0f, uiPeakOut = 0.0f;
     float gainUI = 1.0f, masterUI = 0.5f;
     float trackVolUI = 0.7f;
+    float sysVolUI = 0.7f;
+    bool sysEnabledUI = false;   // intentie "Windows-audio meespelen" (persistent)
+    bool sysSession = false;     // er draait nu een systeemaudio-sessie
+    double sysSessionT0 = 0.0;   // starttijd sessie (grace voor engine-start)
+    double sysLastRunT = 0.0;    // laatste moment dat de engine draaide
+    double sysSilentT0 = -1.0;   // sinds wanneer geen capture-signaal
+    int sysPollN = 0;            // throttle voor de default-device-bewaker
+    std::wstring sysDevId;       // gekozen muziek-endpoint (persistent)
     float eqBassUI = 0.0f, eqMidUI = 0.0f, eqTrebleUI = 0.0f;
     float gateUI = -90.0f;
     int catSel = -1;     // -1 = alle, -2 = favorieten, -3 = cabinets/IR's
@@ -2592,9 +3117,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     for (int i = 0; i < (int)irs.size(); i++)
                         if (irs[i].label == savedIr) selIr = i;
                 librarySort = j.value("library_sort", 0);
+                std::string sysDev = j.value("sys_device_id", "");
+                sysDevId.assign(sysDev.begin(), sysDev.end());
+                sysVolUI = j.value("sys_volume", 0.7f);
+                sysEnabledUI = j.value("sys_enabled", false);
             } catch (...) {}
         }
     }
+    g.sysVol.store(sysVolUI);
     if (selIr >= 0) loadIrAsync(irs[selIr].path);  // klaarzetten voor start
 
     // sorteert modellen en IR's volgens librarySort; selecties blijven kloppen
@@ -2647,10 +3177,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
         }
         nlohmann::json favs = nlohmann::json::array();
         for (auto& fv : favorites) favs.push_back(fv);
+        std::string sysId(sysDevId.begin(), sysDevId.end());
         nlohmann::json j = {{"output_device_id", id},
                             {"favorites", favs},
                             {"ir", selIr >= 0 ? irs[selIr].label : ""},
-                            {"library_sort", librarySort}};
+                            {"library_sort", librarySort},
+                            {"sys_device_id", sysId},
+                            {"sys_volume", sysVolUI},
+                            {"sys_enabled", sysEnabledUI}};
         FILE* f = _wfopen(settingsFile.wstring().c_str(), L"wb");
         if (f) {
             std::string s = j.dump(2);
@@ -2660,6 +3194,74 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
     };
     auto currentOutId = [&]() -> std::wstring {
         return selOut >= 0 ? outDevices[selOut].id : L"";
+    };
+    // engine-outputdevice als echte ID ("Automatisch" = Realtek Digital);
+    // nodig om het muziek-endpoint van de engine-output te scheiden
+    auto resolvedOutId = [&]() -> std::wstring {
+        if (selOut >= 0) return outDevices[selOut].id;
+        for (auto& d : outDevices)
+            if (lowerStr(d.name).find("realtek digital") != std::string::npos)
+                return d.id;
+        return L"";
+    };
+    // systeemaudio-sessie: gekoppeld aan de engine-sessie zodat de volgorde
+    // nooit uitmaakt. Bij Start (met vinkje aan) wordt éérst het default-
+    // device omgezet (spelende streams verhuizen dan weg van de engine-
+    // output vóórdat die exclusive geclaimd wordt); bij Stop gaat alles
+    // terug en werkt Windows-audio weer gewoon.
+    auto beginSysSession = [&] {
+        if (sysSession) return;
+        std::wstring outId = resolvedOutId();
+        bool valid = false;
+        for (auto& d : outDevices)
+            if (d.id == sysDevId && d.id != outId) valid = true;
+        if (!valid) {
+            sysDevId.clear();
+            // voorkeur: monitor/HDMI-endpoints — daar is de mute-truc
+            // gemeten; anders het eerste andere endpoint
+            for (auto& d : outDevices)
+                if (d.id != outId &&
+                    lowerStr(d.name).find("nvidia") != std::string::npos) {
+                    sysDevId = d.id;
+                    break;
+                }
+            if (sysDevId.empty())
+                for (auto& d : outDevices)
+                    if (d.id != outId) {
+                        sysDevId = d.id;
+                        break;
+                    }
+        }
+        if (sysDevId.empty()) {
+            g.setSysStatus("geen tweede endpoint beschikbaar voor "
+                           "Windows-audio");
+            return;
+        }
+        startSysAudio(sysDevId);
+        sysSession = true;
+        sysSessionT0 = ImGui::GetTime();
+        sysSilentT0 = -1.0;
+    };
+    auto endSysSession = [&] {
+        stopSysAudio();
+        sysSession = false;
+    };
+    // muziek-endpoint mag nooit de engine-output zijn; bij een botsing
+    // automatisch een ander endpoint kiezen (of anders stoppen)
+    auto sysGuardConflict = [&] {
+        if (!sysDevId.empty() && sysDevId == resolvedOutId()) {
+            bool wasActive = sysSession;
+            if (sysSession) endSysSession();
+            sysDevId.clear();
+            saveSettings();
+            if (wasActive) beginSysSession();
+        }
+    };
+    // engine herstarten tijdens een sessie kan gewoon: de wake-claim in
+    // engineMain (v1.5) garandeert een hoorbare claim, de sessie en de
+    // muziek lopen door
+    auto restartEngineForOutput = [&](const std::wstring& mp) {
+        startEngine(mp, currentOutId());
     };
 
     // apparaatvolume (IAudioEndpointVolume) van het gekozen outputdevice;
@@ -2878,9 +3480,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                 if (models[i].label == p.model) newModel = i;
         bool modelChanged = newModel >= 0 && newModel != selModel;
         if (newModel >= 0) selModel = newModel;
+        if (outChanged) sysGuardConflict();
         if (g.running.load()) {
             if (outChanged && !models.empty())
-                startEngine(models[selModel].path, currentOutId());
+                restartEngineForOutput(models[selModel].path);
             else if (modelChanged)
                 loadModelAsync(models[selModel].path);
         }
@@ -3005,8 +3608,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     if (selOut != -1) {
                         selOut = -1;
                         saveSettings();
+                        sysGuardConflict();
                         if (running && !models.empty())
-                            startEngine(models[selModel].path, currentOutId());
+                            restartEngineForOutput(models[selModel].path);
                     }
                 }
                 for (int i = 0; i < (int)outDevices.size(); i++) {
@@ -3015,9 +3619,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                         if (selOut != i) {
                             selOut = i;
                             saveSettings();
+                            sysGuardConflict();
                             if (running && !models.empty())
-                                startEngine(models[selModel].path,
-                                            currentOutId());
+                                restartEngineForOutput(models[selModel].path);
                         }
                     }
                 }
@@ -3279,8 +3883,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                                   ImVec4(0.17f, 0.62f, 0.38f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                                   ImVec4(0.11f, 0.45f, 0.27f, 1.0f));
-            if (ImGui::Button("Start", ImVec2(110, 0)) && !models.empty())
-                startEngine(models[selModel].path, currentOutId());
+            if (ImGui::Button("Start", ImVec2(110, 0)) && !models.empty()) {
+                // sessie eerst: default weg van de engine-output zodat
+                // spelende media naadloos wegmigreren (geen kick/pauze);
+                // de engine krijgt een korte migratie-wachttijd mee en de
+                // wake-claim (v1.5) dekt de USB-suspend-valkuil af
+                bool fresh = false;
+                if (sysEnabledUI && !sysSession) {
+                    beginSysSession();
+                    fresh = sysSession;
+                }
+                startEngine(models[selModel].path, currentOutId(),
+                            fresh ? 2500 : 0);
+            }
             ImGui::PopStyleColor(3);
         } else {
             ImGui::PushStyleColor(ImGuiCol_Button,
@@ -3289,7 +3904,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                                   ImVec4(0.72f, 0.28f, 0.24f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,
                                   ImVec4(0.55f, 0.18f, 0.16f, 1.0f));
-            if (ImGui::Button("Stop", ImVec2(110, 0))) stopEngine();
+            if (ImGui::Button("Stop", ImVec2(110, 0))) {
+                stopEngine();
+                endSysSession();  // Windows-audio meteen weer gewoon
+            }
             ImGui::PopStyleColor(3);
         }
         ImGui::SameLine();
@@ -4007,6 +4625,106 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
 
         // --- tab: meespelen ---
         if (ImGui::BeginTabItem("Meespelen")) {
+        // --- systeemaudio: alles wat Windows afspeelt als backing audio ---
+        sectionHeader("SYSTEEMAUDIO");
+        {
+            bool en = sysEnabledUI;
+            if (ImGui::Checkbox("Windows-audio meespelen "
+                                "(Spotify / YouTube / VLC)",
+                                &en)) {
+                sysEnabledUI = en;
+                saveSettings();
+                if (en && running) beginSysSession();
+                if (!en) endSysSession();
+            }
+        }
+        ImGui::SetNextItemWidth(300);
+        {
+            std::string prevName;
+            for (auto& d : outDevices)
+                if (d.id == sysDevId) prevName = d.name;
+            if (ImGui::BeginCombo("Muziek-endpoint",
+                                  prevName.empty() ? "(automatisch)"
+                                                   : prevName.c_str())) {
+                std::wstring outId = resolvedOutId();
+                for (auto& d : outDevices) {
+                    if (d.id == outId) continue;  // engine-output uitsluiten
+                    if (ImGui::Selectable(d.name.c_str(),
+                                          d.id == sysDevId)) {
+                        if (d.id != sysDevId) {
+                            sysDevId = d.id;
+                            saveSettings();
+                            sysSilentT0 = -1.0;
+                            if (sysSession) retargetSysAudio(sysDevId);
+                        }
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        }
+        ImGui::SetNextItemWidth(300);
+        if (ImGui::SliderFloat("Muziekvolume", &sysVolUI, 0.0f, 1.5f,
+                               "%.2f"))
+            g.sysVol.store(sysVolUI);
+        if (ImGui::IsItemDeactivatedAfterEdit()) saveSettings();
+        ImGui::SameLine();
+        {
+            bool m = g.sysMuted.load();
+            if (ImGui::Checkbox("Mute muziek", &m)) g.sysMuted.store(m);
+        }
+        if (sysSession && g.sysActive.load()) {
+            if (running) {
+                float cp = g.sysCapPeak.load();
+                float mp = g.sysMixPeak.load();
+                g.sysMixPeak.store(mp * 0.9f);  // decay in de UI
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f),
+                                   "actief - muziekbuffer %d ms  |  "
+                                   "capture %.0f dB  |  mix %.0f dB",
+                                   g.sysFillMs.load(),
+                                   20.0f * log10f(cp > 1e-5f ? cp : 1e-5f),
+                                   20.0f * log10f(mp > 1e-5f ? mp : 1e-5f));
+                // capture loopt maar er komt niets binnen: meestal een
+                // mediastream die stierf toen de engine de output claimde
+                double tNow = ImGui::GetTime();
+                if (g.sysCapPeak.load() < 0.01f) {
+                    if (sysSilentT0 < 0.0) sysSilentT0 = tNow;
+                    else if (tNow - sysSilentT0 > 2.5)
+                        ImGui::TextColored(
+                            ImVec4(0.9f, 0.8f, 0.3f, 1.0f),
+                            "geen Windows-audio gedetecteerd - speelt er "
+                            "iets af? zo ja: pauzeer/hervat de speler of "
+                            "ververs de YouTube-pagina");
+                } else {
+                    sysSilentT0 = -1.0;
+                }
+            } else {
+                ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.3f, 1.0f),
+                                   "wacht op de engine...");
+            }
+        } else if (sysSession) {
+            ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.3f, 1.0f), "starten...");
+        } else if (sysEnabledUI) {
+            ImGui::TextDisabled("klaar - wordt actief zodra de engine start");
+        } else {
+            ImGui::TextDisabled("inactief");
+        }
+        {
+            std::string ss = g.getSysStatus();
+            if (!ss.empty())
+                ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.4f, 1.0f), "%s",
+                                   ss.c_str());
+        }
+        ImGui::TextDisabled(
+            "de muziek hoor je gewoon via de app op je normale output; het "
+            "muziek-endpoint is alleen een onhoorbaar doorgeefluik (je "
+            "eigen output staat er daarom niet tussen). Bij Stop wordt "
+            "Windows-audio automatisch hersteld.");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // --- bestand afspelen (lokale audiobestanden) ---
+        sectionHeader("BESTAND AFSPELEN");
         if (ImGui::Button("Nummer openen...")) {
             std::wstring f = openAudioFileDialog(hwnd);
             if (!f.empty()) loadTrackAsync(f);
@@ -4189,6 +4907,31 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
         }  // einde tabbar
         ImGui::EndChild();  // card_tabs
 
+        // systeemaudio-sessie bewaken (foolproof):
+        // - capture gestorven (endpoint weg) -> alles herstellen;
+        // - engine niet (meer) actief -> sessie beëindigen, Windows-audio
+        //   weer gewoon (met grace voor engine-start en -herstart);
+        // - default-device door Windows/gebruiker omgezet -> terugzetten,
+        //   anders speelt de muziek onhoorbaar ergens anders
+        if (running) sysLastRunT = ImGui::GetTime();
+        if (sysSession) {
+            double tNow = ImGui::GetTime();
+            if (gSysDone.load()) {
+                endSysSession();
+            } else if (!running && tNow - sysSessionT0 > 10.0 &&
+                       tNow - sysLastRunT > 10.0) {
+                // ruim: engine-start kan met migratie-wachttijd ~6 s duren
+                endSysSession();
+            } else if (g.sysActive.load() && ++sysPollN >= 150) {
+                sysPollN = 0;
+                if (getDefaultRenderId() != sysDevId) {
+                    setDefaultEndpoint(sysDevId);
+                    g.setSysStatus("default-device teruggezet naar het "
+                                   "muziek-endpoint");
+                }
+            }
+        }
+
         // nieuwe downloads automatisch in de dropdown tonen
         if (g.modelsChanged.exchange(false)) {
             std::wstring keep =
@@ -4243,10 +4986,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
             ImGui::Text("latency: %.1f ms software (3.0 in + %.1f uit)",
                         3.0 + padMs, padMs);
             ImGui::Text("NAM: %.2f ms/blok (max %.2f)  |  underruns: %ld  |  "
-                        "driftcorrectie: %ld frames  |  late wakeups: %ld",
+                        "driftcorrectie: %ld frames  |  late wakeups: %ld  |  "
+                        "wakeups: %ld",
                         g.dspAvgUs.load() / 1000.0, g.dspMaxUs.load() / 1000.0,
                         g.underruns.load(), g.driftCorr.load(),
-                        g.lateWakeups.load());
+                        g.lateWakeups.load(), g.wakeupsStat.load());
             double msr = g.modelSR.load();
             if (msr > 0 && (int)msr != SR)
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
@@ -4266,6 +5010,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
     }
 
     stopEngine();
+    stopSysAudio();  // herstelt default-device en endpoint-mute
     if (gLogoSRV) gLogoSRV->Release();
     for (auto& t : gCatArt)
         if (t) t->Release();
