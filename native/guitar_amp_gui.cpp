@@ -2495,6 +2495,24 @@ static float detectPitch(const float* x, int n) {
     return (float)SR / t;
 }
 
+// Stemmingen (laag -> hoog, MIDI-nummers). Laatste = chromatisch.
+struct Tuning {
+    const char* name;
+    int midi[6];
+};
+static const Tuning kTunings[] = {
+    {"E standaard  (E A D G B E)", {40, 45, 50, 55, 59, 64}},
+    {"Drop D  (D A D G B E)", {38, 45, 50, 55, 59, 64}},
+    {"Eb standaard  (Eb Ab Db Gb Bb Eb)", {39, 44, 49, 54, 58, 63}},
+    {"D standaard  (D G C F A D)", {38, 43, 48, 53, 57, 62}},
+    {"Drop C  (C G C F A D)", {36, 43, 48, 53, 57, 62}},
+    {"C# standaard  (C# F# B E G# C#)", {37, 42, 47, 52, 56, 61}},
+    {"Drop B  (B F# B E G# C#)", {35, 42, 47, 52, 56, 61}},
+    {"Chromatisch  (elke noot)", {0, 0, 0, 0, 0, 0}},
+};
+static const int kNumTunings = (int)(sizeof(kTunings) / sizeof(kTunings[0]));
+static const int kChromatic = kNumTunings - 1;
+
 // Laadt een model op een achtergrondthread en biedt het de draaiende engine
 // aan via pendingModel â€” de audio speelt intussen gewoon door.
 static void loadModelAsync(const std::wstring& path) {
@@ -3088,6 +3106,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
     std::vector<IrEntry> irs = scanIrs();
     int selIr = -1;       // -1 = geen IR
     int librarySort = 0;  // 0 = naam, 1 = nieuwste eerst
+    int tuning = 0;       // index in kTunings
 
     // outputdevice-keuze + favorieten, persistentie in settings.json
     std::vector<OutDevice> outDevices = enumRenderDevices();
@@ -3117,6 +3136,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                     for (int i = 0; i < (int)irs.size(); i++)
                         if (irs[i].label == savedIr) selIr = i;
                 librarySort = j.value("library_sort", 0);
+                tuning = j.value("tuning", 0);
+                if (tuning < 0 || tuning >= kNumTunings) tuning = 0;
                 std::string sysDev = j.value("sys_device_id", "");
                 sysDevId.assign(sysDev.begin(), sysDev.end());
                 sysVolUI = j.value("sys_volume", 0.7f);
@@ -3182,6 +3203,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                             {"favorites", favs},
                             {"ir", selIr >= 0 ? irs[selIr].label : ""},
                             {"library_sort", librarySort},
+                            {"tuning", tuning},
                             {"sys_device_id", sysId},
                             {"sys_volume", sysVolUI},
                             {"sys_enabled", sysEnabledUI}};
@@ -4798,18 +4820,62 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                 }
             }
             bool fresh = ImGui::GetTime() - tunerLastSeen < 1.5;
+            static const char* names[12] = {"C",  "C#", "D",  "D#",
+                                            "E",  "F",  "F#", "G",
+                                            "G#", "A",  "A#", "B"};
+            auto noteName = [&](int midi, char* out, size_t n) {
+                snprintf(out, n, "%s%d", names[((midi % 12) + 12) % 12],
+                         midi / 12 - 1);
+            };
+            // keuze van stemming
+            ImGui::TextDisabled("stemming");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(300.0f);
+            if (ImGui::BeginCombo("##tuning", kTunings[tuning].name)) {
+                for (int i = 0; i < kNumTunings; i++)
+                    if (ImGui::Selectable(kTunings[i].name, i == tuning)) {
+                        tuning = i;
+                        saveSettings();
+                    }
+                ImGui::EndCombo();
+            }
+            // dichtstbijzijnde doelnoot: snaar van de stemming, of chromatisch
+            float semis = 12.0f * log2f(tunerFreq > 0.0f ? tunerFreq / 440.0f
+                                                         : 1.0f);
+            int targetMidi = (int)lrintf(semis) + 69;
+            int targetString = -1;
+            if (tuning != kChromatic) {
+                float bestDist = 1e9f;
+                for (int i = 0; i < 6; i++) {
+                    float d = fabsf(semis + 69.0f - kTunings[tuning].midi[i]);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        targetString = i;
+                    }
+                }
+                targetMidi = kTunings[tuning].midi[targetString];
+            }
+            bool showPitch = running && fresh && tunerFreq > 0.0f;
+            // snaren van de gekozen stemming, actieve doelsnaar oplichtend
+            if (tuning != kChromatic) {
+                for (int i = 0; i < 6; i++) {
+                    if (i) ImGui::SameLine(0.0f, 14.0f);
+                    char nm[16];
+                    noteName(kTunings[tuning].midi[i], nm, sizeof(nm));
+                    bool hot = showPitch && i == targetString;
+                    ImGui::SetWindowFontScale(1.3f);
+                    ImGui::TextColored(hot ? ImVec4(0.95f, 0.85f, 0.3f, 1.0f)
+                                           : ImVec4(0.55f, 0.55f, 0.55f, 1.0f),
+                                       "%s", nm);
+                    ImGui::SetWindowFontScale(1.0f);
+                }
+            }
             if (!running) {
                 ImGui::TextDisabled("start de engine om te stemmen");
-            } else if (fresh && tunerFreq > 0.0f) {
-                static const char* names[12] = {"C",  "C#", "D",  "D#",
-                                                "E",  "F",  "F#", "G",
-                                                "G#", "A",  "A#", "B"};
-                float semis = 12.0f * log2f(tunerFreq / 440.0f);
-                int midi = (int)lrintf(semis) + 69;
-                float cents = (semis - (midi - 69)) * 100.0f;
+            } else if (showPitch) {
+                float cents = (semis + 69.0f - targetMidi) * 100.0f;
                 char note[16];
-                snprintf(note, sizeof(note), "%s%d", names[((midi % 12) + 12) % 12],
-                         midi / 12 - 1);
+                noteName(targetMidi, note, sizeof(note));
                 bool inTune = fabsf(cents) < 5.0f;
                 ImGui::SetWindowFontScale(2.4f);
                 ImGui::TextColored(inTune ? ImVec4(0.3f, 0.95f, 0.4f, 1.0f)
@@ -4818,17 +4884,69 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                 ImGui::SetWindowFontScale(1.0f);
                 ImGui::SameLine();
                 ImGui::Text("  %.1f Hz  %+.0f cent", tunerFreq, cents);
-                float frac = (cents + 50.0f) / 100.0f;
-                if (frac < 0.0f) frac = 0.0f;
-                if (frac > 1.0f) frac = 1.0f;
-                ImGui::PushStyleColor(
-                    ImGuiCol_PlotHistogram,
-                    inTune ? ImVec4(0.3f, 0.85f, 0.4f, 1.0f)
-                           : ImVec4(0.85f, 0.7f, 0.25f, 1.0f));
-                ImGui::ProgressBar(frac, ImVec2(-1, 0), "");
-                ImGui::PopStyleColor();
-                ImGui::TextDisabled("        laag <- | -> hoog   (midden = "
-                                    "zuiver)");
+                ImGui::Dummy(ImVec2(0.0f, 10.0f));
+                // meter: schaal -50..+50 cent, middenlijn = zuiver,
+                // groene zone +-5 cent, naald op de gemeten afwijking
+                {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImVec2 p0 = ImGui::GetCursorScreenPos();
+                    float w = ImGui::GetContentRegionAvail().x;
+                    float h = 34.0f;
+                    ImVec2 p1(p0.x + w, p0.y + h);
+                    float cx = p0.x + w * 0.5f;
+                    auto xAt = [&](float c) {
+                        return p0.x + (c + 50.0f) / 100.0f * w;
+                    };
+                    dl->AddRectFilled(p0, p1, IM_COL32(28, 30, 36, 255), 4.0f);
+                    // groene zuiver-zone
+                    dl->AddRectFilled(ImVec2(xAt(-5.0f), p0.y),
+                                      ImVec2(xAt(5.0f), p1.y),
+                                      IM_COL32(45, 110, 60, 255));
+                    // streepjes elke 10 cent, langer bij 25 en 50
+                    for (int c = -50; c <= 50; c += 10) {
+                        if (c == 0) continue;
+                        float th = (c % 50 == 0) ? h : h * 0.3f;
+                        float x = xAt((float)c);
+                        dl->AddLine(ImVec2(x, p1.y - th), ImVec2(x, p1.y),
+                                    IM_COL32(110, 115, 125, 255), 1.0f);
+                    }
+                    for (int c = -25; c <= 25; c += 50) {
+                        float x = xAt((float)c);
+                        dl->AddLine(ImVec2(x, p1.y - h * 0.6f), ImVec2(x, p1.y),
+                                    IM_COL32(110, 115, 125, 255), 1.0f);
+                    }
+                    // middenlijn (wit, dik)
+                    dl->AddLine(ImVec2(cx, p0.y - 4.0f), ImVec2(cx, p1.y + 4.0f),
+                                IM_COL32(235, 235, 240, 255), 3.0f);
+                    // naald
+                    float cc = cents;
+                    if (cc < -50.0f) cc = -50.0f;
+                    if (cc > 50.0f) cc = 50.0f;
+                    float nx = xAt(cc);
+                    ImU32 ncol = inTune ? IM_COL32(80, 240, 100, 255)
+                                        : IM_COL32(240, 200, 70, 255);
+                    dl->AddLine(ImVec2(nx, p0.y), ImVec2(nx, p1.y), ncol, 4.0f);
+                    dl->AddTriangleFilled(ImVec2(nx - 7.0f, p0.y - 10.0f),
+                                          ImVec2(nx + 7.0f, p0.y - 10.0f),
+                                          ImVec2(nx, p0.y - 1.0f), ncol);
+                    dl->AddRect(p0, p1, IM_COL32(70, 74, 84, 255), 4.0f);
+                    ImGui::Dummy(ImVec2(w, h + 4.0f));
+                    // labels onder de schaal
+                    const char* lbl[5] = {"-50", "-25", "0", "+25", "+50"};
+                    float lp0y = ImGui::GetCursorScreenPos().y;
+                    for (int i = 0; i < 5; i++) {
+                        float x = xAt(-50.0f + 25.0f * i);
+                        ImVec2 ts = ImGui::CalcTextSize(lbl[i]);
+                        float tx = x - ts.x * 0.5f;
+                        if (tx < p0.x) tx = p0.x;
+                        if (tx + ts.x > p1.x) tx = p1.x - ts.x;
+                        dl->AddText(ImVec2(tx, lp0y), IM_COL32(140, 145, 155, 255),
+                                    lbl[i]);
+                    }
+                    ImGui::Dummy(ImVec2(w, ImGui::GetTextLineHeight()));
+                }
+                ImGui::TextDisabled("        laag <- | -> hoog   (naald op de "
+                                    "witte middenlijn = zuiver)");
             } else {
                 ImGui::TextDisabled("speel een losse snaar...");
             }
