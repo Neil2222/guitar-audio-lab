@@ -1,54 +1,67 @@
 # Guitar Audio Lab
 
-Onderzoeksproject: elektrische gitaar → Rocksmith Real Tone USB Cable → Windows 11 →
-realtime processing → optische S/PDIF-output, met zo laag mogelijke latency.
+**Een gitaarversterker op je Windows-pc.** Sluit een elektrische gitaar aan met een Rocksmith Real Tone-kabel, kies een
+versterker uit een bibliotheek van [Neural Amp Modeler](https://github.com/sdatkinson/NeuralAmpModelerCore)-captures,
+zet er een speakerkast (cabinet-IR) achter en speel met lage latency naar je speakers of de optische S/PDIF-uitgang. Spotify of YouTube spelen mee op de achtergrond.
 
-Doel op termijn: eigen lichte gitaarsoftware rond bestaande open-source componenten
-(Neural Amp Modeler, cabinet-IR's, e.d.). Eerst bewijzen dat de kale audio-pipeline werkt.
+<p align="center">
+  <img src="docs/images/hoofdscherm.png" width="860" alt="Guitar Audio Lab: een Vox AC15-model met een AC30-cabinet geladen, de engine actief, de bibliotheek met categorieën en het detailpaneel met versterkerplaatje">
+</p>
 
-## Status
+## Wat kan het
 
-- **Fase 1 — Inventarisatie: afgerond** (2026-08-15), zie [docs/fase1-inventarisatie.md](docs/fase1-inventarisatie.md)
-- **Fase 2/3 — Passthrough + latency-optimalisatie: afgerond** (2026-08-15), zie
-  [docs/fase2-passthrough.md](docs/fase2-passthrough.md) (Python/PortAudio, ~17,5 ms)
-  en [docs/fase3-native.md](docs/fase3-native.md) (native C++/WASAPI,
-  **~4,8 ms software, 0 underruns**). Speeltest: `native\passthrough_ll.exe --seconds 300`
-- **Fase 4 — Amp modelling (NAM): eerste integratie werkt** (2026-08-15), zie
-  [docs/fase4-nam.md](docs/fase4-nam.md). `native\guitar_amp.exe` draait NAM-modellen
-  in de 4,8 ms-pipeline (NAM kost 0,13 ms/blok). Vier echte captures in `models/`.
-  Speeltest: `native\guitar_amp.exe --seconds 300 --model "models\Tim R JCM2000 Crunch.nam"`
-- **Fase 5 — GUI: v2.0** (2026-08-15), zie [docs/fase5-gui.md](docs/fase5-gui.md).
-  v1.5: outputdevice-keuze (elk render-device, incl. Bluetooth via shared-fallback).
-  v2.0: **professionele restyling** (Segoe UI, donker cardthema) en een echte
-  **bibliotheekbrowser** met categorieën, favorieten, zoeken en detailpaneel.
-  v2.1: **presets** (complete instelling incl. model en outputdevice, `presets.json`)
-  en compacte controls op één regel. v2.3: **metadata-bibliotheek** (zoeken op
-  "fender clean", ratings, TONE3000-tags). v2.4: **cabinet-IR's** (map `irs\`,
-  Cabinet-dropdown, IR in presets, TONE3000-IR-downloads).
-  **`native\guitar_amp_gui.exe`**: zijbalk (devices/status/levels), modelkeuze met
-  hot-swap en **categorieën**, **noise gate**, 3-bands EQ, stemmer (YIN),
-  meespeel-speler (Media Foundation), **TONE3000-integratie** (OAuth PKCE, zoeken op
-  populariteit, 1-klik-download) en de GitHub-communitylijst.
-  Open: cabinet-IR, presets, ASRC, artwork (ComfyUI via NeilChat)
+- **Echte versterkers, als model.** NAM-captures van onder meer Fender, Marshall, Vox, Mesa en EVH, in een
+  bibliotheek met categorieën, favorieten, zoeken, ratings en tags. Wisselen kan tijdens het spelen, zonder dat het
+  geluid wegvalt.
+- **Speakerkasten.** Cabinet-IR's (impulsresponsies) achter het model, of direct uit het model als de capture de kast
+  al bevat.
+- **De knoppen die je verwacht.** Gain, noise gate, master en een 3-bands EQ, plus **presets** die de complete
+  instelling bewaren (model, kast, output).
+- **Kalibratie.** Vertel de app welk niveau je kabel aflevert; dan krijgt elk model het ingangsniveau waarvoor het is
+  opgenomen, en met *volume gelijk* klinken alle modellen even hard.
+- **Nieuwe tones vinden.** Zoek in de duizenden tones op [TONE3000](https://www.tone3000.com) (populairste eerst,
+  filters op type, geverifieerd en gekalibreerd) en haal ze met één klik binnen; of kies uit de GitHub-communitylijst.
+- **Meespelen.** Alles wat Windows afspeelt (Spotify, YouTube, VLC) mixt mee in je gitaargeluid, of speel een
+  audiobestand af.
+- **Stemmer**, ook voor alternatieve stemmingen (drop D, drop C, ...).
 
-## Kernbevindingen Fase 1 (samenvatting)
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/tone3000.png" alt="Het TONE3000-tabblad: de meest gedownloade tones met maker, type, downloads en favorieten, en ophalen-knoppen"></td>
+    <td width="50%"><img src="docs/images/meespelen.png" alt="Het Meespelen-tabblad: Windows-audio meespelen via een muziek-endpoint, met volume en mute, en een bestand afspelen"></td>
+  </tr>
+  <tr>
+    <td><b>TONE3000:</b> zoeken, filteren en met één klik ophalen.</td>
+    <td><b>Meespelen:</b> Spotify of YouTube in je gitaargeluid gemixt.</td>
+  </tr>
+</table>
 
-- **Rocksmith Real Tone Cable** (`USB\VID_12BA&PID_00FF`): USB Audio Class-device op de
-  generieke Microsoft `usbaudio`-driver. **Mono, max 48 kHz**, capture-only.
-  Werkt in WASAPI Shared én WASAPI **Exclusive** (1ch @ 44.1/48 kHz).
-- **Optische uitgang**: "Realtek Digital Output (Realtek USB Audio)" — de onboard audio is
-  een **USB-gebaseerde Realtek-codec** (`VID_26CE&PID_0A08`, driver 6.4.0.2395).
-  Stereo, 24-bit, ondersteunt WASAPI Exclusive tot 96 kHz. Is de huidige Windows-default output.
-- **Windows shared mix**: beide endpoints staan op 48 kHz → geen resampling nodig als wij
-  ook op 48 kHz werken.
-- **ASIO**: alleen "Realtek ASIO" aanwezig (alleen voor het Realtek-device, niet voor de
-  Rocksmith-input). Geen ASIO4ALL/FlexASIO geïnstalleerd.
-- **Beste route voor Fase 2**: WASAPI (Shared eerst, daarna Exclusive) via een
-  PortAudio-gebaseerde passthrough, 48 kHz, mono in → stereo uit.
+## Hoe het werkt
+
+```
+gitaar → Rocksmith-kabel → WASAPI Exclusive → NAM-model → cabinet-IR → EQ → mix → S/PDIF of andere output
+                                                                             ↑
+                                                  Windows-audio (loopback) of een bestand
+```
+
+Alles draait in één native C++-programma (`native\guitar_amp_gui.exe`) met een GUI in
+[Dear ImGui](https://github.com/ocornut/imgui). De lage latency was het eigenlijke onderzoek: van ~50 ms met een
+standaard audiobibliotheek, via 17,5 ms, naar **4,8 ms** in de native passthrough, door de capture-events van de kabel
+als klok te gebruiken en de output te pollen. Een NAM-model kost daarbovenop zo'n 0,1 tot 0,4 ms per blok. De app past zijn outputbuffer
+per apparaat aan (zo klein als het zonder underruns kan; S/PDIF vraagt meer dan een analoge uitgang) en toont de
+actuele latency, underruns en driftcorrectie live. Het hele verhaal per fase: [docs/onderzoek.md](docs/onderzoek.md).
+
+## Wat heb je nodig
+
+- Windows 11 en een **Rocksmith Real Tone Cable**: de input is nog aan deze kabel gekoppeld (mono, 16 bit, 48 kHz);
+  een vrije inputkeuze staat op de roadmap.
+- Een output: elk afspeelapparaat (getest met de optische Realtek-uitgang; Bluetooth via een shared-fallback).
+- Visual Studio 2022 met de C++-workload, om te bouwen.
+- Modellen en IR's: die haal je in de app binnen (een TONE3000-account met publishable key, of de communitylijst).
 
 ## Bouwen (Windows)
 
-Vereist: Visual Studio 2022 (C++-workload). Eenmalig:
+Eenmalig de NAM-bibliotheek bouwen:
 
 ```powershell
 git clone --recurse-submodules https://github.com/Neil2222/guitar-audio-lab.git
@@ -65,36 +78,23 @@ Let op bij het linken tegen nam.lib: `/WHOLEARCHIVE:` is verplicht (static
 initializers registreren de netwerkarchitecturen).
 
 **Niet in de repo** (zie `.gitignore`): persoonlijke instellingen/presets,
-TONE3000-tokens (`t3k.json`), en gedownloade modellen/IR's — die haal je
-zelf via de app binnen (TONE3000-account met publishable key, of de
-GitHub-communitylijst).
+TONE3000-tokens (`t3k.json`), en gedownloade modellen/IR's: die haal je
+zelf via de app binnen.
 
-De input is momenteel nog gekoppeld aan de Rocksmith Real Tone Cable
-(devicenaam-match, mono/16-bit/48 kHz); een vrije inputkeuze zoals bij de
-output staat op de roadmap.
+## Documentatie
 
-## Structuur
-
-```
-scripts/   kleine diagnostische en testscripts (uv run scripts/<naam>.py)
-native/    C++ WASAPI-tools (MSVC; bouwen met native\build.ps1)
-docs/      onderzoeksdocumentatie per fase
-```
-
-Scripts draaien met [uv](https://docs.astral.sh/uv/) via inline script-dependencies:
-`uv run scripts/probe_devices.py` — geen aparte venv-setup nodig.
-
-## Scripts
-
-| Script | Doel |
+| Document | Inhoud |
 |---|---|
-| `scripts/probe_devices.py` | Alle audio-devices per host-API + sample-rate-support |
-| `scripts/probe_wasapi_exclusive.py` | WASAPI Exclusive formaat-support voor Rocksmith-input en S/PDIF-output |
-| `scripts/probe_wdmks_open.py` | WDM-KS pin-open-test (toonde intermitterende `-9996` op default output) |
-| `scripts/passthrough.py` | Full-duplex passthrough in één PortAudio-stream + `--bench` matrix (dood spoor: ~50 ms vloer) |
-| `scripts/split_passthrough.py` | Losse WASAPI Exclusive in/out-streams + ringbuffer via PortAudio (~17,5 ms; door native route achterhaald) |
-| `native/passthrough.cpp` | Native event-driven variant; legde de 10 ms-eventbatching van de Realtek-driver bloot |
-| `native/probe_iac3.cpp` | IAudioClient3 engine-periodes (dood spoor: min 10 ms) |
-| `native/probe_asio.cpp` | Realtek ASIO-probe zonder SDK (dood spoor: vaste 1024-buffer) |
-| `native/probe_padding.cpp` | DMA-granulariteitsmeting (de doorbraak: positie loopt per frame) |
-| `native/passthrough_ll.exe` | **De winnaar**: exclusive capture-event als klok + polling render, **~4,8 ms** |
+| [Onderzoek](docs/onderzoek.md) | Status per fase, kernbevindingen, de diagnostische scripts en tools |
+| [Fase 1: inventarisatie](docs/fase1-inventarisatie.md) | De kabel, de optische uitgang, WASAPI en ASIO op dit systeem |
+| [Fase 2: passthrough](docs/fase2-passthrough.md) | Python/PortAudio, ~17,5 ms |
+| [Fase 3: native](docs/fase3-native.md) | C++/WASAPI, 4,8 ms en 0 underruns |
+| [Fase 4: NAM](docs/fase4-nam.md) | Amp modelling in de pipeline |
+| [Fase 5: GUI](docs/fase5-gui.md) | De app: bibliotheek, presets, cabinet-IR's, TONE3000 |
+| [Fase 6](docs/fase6-onderzoek-systeemaudio.md) en [7](docs/fase7-systeemaudio.md): systeemaudio | Spotify en YouTube laten meespelen |
+
+## Licentie
+
+[MIT](LICENSE). Gebruikt [NeuralAmpModelerCore](https://github.com/sdatkinson/NeuralAmpModelerCore) en
+[Dear ImGui](https://github.com/ocornut/imgui), beide MIT. Gedownloade modellen en IR's vallen onder de licentie van
+hun makers en zitten daarom niet in de repo.
