@@ -5,7 +5,7 @@ versterker uit een bibliotheek van [Neural Amp Modeler](https://github.com/sdatk
 zet er een speakerkast (cabinet-IR) achter en speel met lage latency naar je speakers of de optische S/PDIF-uitgang. Spotify of YouTube spelen mee op de achtergrond.
 
 <p align="center">
-  <img src="docs/images/hoofdscherm.png" width="860" alt="Guitar Audio Lab: een Vox AC15-model met een AC30-cabinet geladen, de engine actief, de bibliotheek met categorieën en het detailpaneel met versterkerplaatje">
+  <img src="docs/images/hoofdscherm.png" width="860" alt="Guitar Audio Lab tijdens het spelen: een Vox AC30 Top Boost-model met een AC30-cabinet, de meters in en uit uitgeslagen, de bibliotheek met categorieën en het detailpaneel met versterkerplaatje">
 </p>
 
 ## Wat kan het
@@ -33,6 +33,12 @@ zet er een speakerkast (cabinet-IR) achter en speel met lage latency naar je spe
   <tr>
     <td><b>TONE3000:</b> zoeken, filteren en met één klik ophalen.</td>
     <td><b>Meespelen:</b> Spotify of YouTube in je gitaargeluid gemixt.</td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/images/stemmer.png" alt="De stemmer: een lage E (E2, 82,5 Hz) op +1 cent, de naald op de middenlijn"></td>
+  </tr>
+  <tr>
+    <td colspan="2"><b>Stemmer:</b> speel een losse snaar; standaard of een alternatieve stemming.</td>
   </tr>
 </table>
 
