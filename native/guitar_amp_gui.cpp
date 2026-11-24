@@ -97,6 +97,20 @@ struct EngineShared {
     std::atomic<float> peakIn{0.0f};      // block-peak, UI reset naar 0
     std::atomic<float> peakOut{0.0f};
     std::atomic<int> padAvgFrames{0};
+    std::atomic<int> targetFrames{0};  // adaptief bufferdoel
+    // NAM-niveaukalibratie: een .nam draagt in zijn metadata hoe heet de
+    // opnamerig was (input_level_dbu = dBu bij 0 dBFS). Voeden we het model
+    // met een ander niveau, dan staat de virtuele amp simpelweg harder of
+    // zachter open dan bedoeld -> clean modellen gaan vervormen.
+    std::atomic<bool> calOn{true};
+    std::atomic<bool> normOn{true};
+    std::atomic<float> calDbu{8.0f};       // dBu bij 0 dBFS van onze input
+    std::atomic<float> calAssumeDbu{15.0f};  // aanname als het model niets zegt
+    std::atomic<bool> calDirty{true};
+    std::atomic<float> trimDb{0.0f};       // readback: input-trim
+    std::atomic<float> normDb{0.0f};       // readback: output-normalisatie
+    std::atomic<float> modelInDbu{0.0f};   // readback: wat het model verwacht
+    std::atomic<bool> modelHasCal{false};
     std::atomic<int> dspAvgUs{0};
     std::atomic<int> dspMaxUs{0};
     std::atomic<long> underruns{0};
@@ -487,8 +501,23 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
         if (FAILED(hr)) ENG_FAIL("Activate render");
         WAVEFORMATEXTENSIBLE outFmt = pcm16(2);
         bool sharedOut = false;
-        hr = renClient->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 200000, 0,
+        // 40 ms renderbuffer: we houden er maar een fractie van gevuld, maar
+        // het bufferdoel hieronder past zich aan en heeft kopruimte nodig.
+        // Niet elk endpoint accepteert die maat -> terugvallen op 20 ms.
+        REFERENCE_TIME renBufDur = 400000;
+        hr = renClient->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, renBufDur, 0,
                                    (WAVEFORMATEX*)&outFmt, nullptr);
+        if (FAILED(hr) && hr != AUDCLNT_E_DEVICE_IN_USE) {
+            renClient->Release();
+            renClient = nullptr;
+            renBufDur = 200000;
+            hr = outDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                  (void**)&renClient);
+            if (SUCCEEDED(hr))
+                hr = renClient->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0,
+                                           renBufDur, 0,
+                                           (WAVEFORMATEX*)&outFmt, nullptr);
+        }
         // ruime retry: een net weg-migrerende mediastream kan het device
         // nog even bezet houden
         for (int retry = 0; hr == AUDCLNT_E_DEVICE_IN_USE && retry < 15;
@@ -499,8 +528,9 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
             hr = outDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                                   (void**)&renClient);
             if (FAILED(hr)) break;
-            hr = renClient->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 200000,
-                                       0, (WAVEFORMATEX*)&outFmt, nullptr);
+            hr = renClient->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0,
+                                       renBufDur, 0,
+                                       (WAVEFORMATEX*)&outFmt, nullptr);
         }
         if (hr == AUDCLNT_E_DEVICE_IN_USE) {
             g.setError("output bezet: sluit apps die geluid afspelen");
@@ -509,8 +539,10 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
         if (FAILED(hr)) {
             // fallback: shared mode met automatische formaatconversie â€”
             // nodig voor devices zonder exclusive-ondersteuning (Bluetooth)
-            renClient->Release();
-            renClient = nullptr;
+            if (renClient) {
+                renClient->Release();
+                renClient = nullptr;
+            }
             hr = outDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                                   (void**)&renClient);
             if (FAILED(hr)) ENG_FAIL("re-Activate render (shared)");
@@ -524,24 +556,37 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
             sharedOut = true;
         }
         g.outShared.store(sharedOut);
-        // padding-doel: exclusive kan strak (6 ms); shared verbruikt in
-        // 10 ms-porties, dus daar ruimer mikken (30 ms)
-        const UINT32 TARGET = sharedOut ? 1440 : 288;
-        const UINT32 slack = sharedOut ? 512 : 96;
         UINT32 renFrames = 0;
         renClient->GetBufferSize(&renFrames);
         hr = renClient->GetService(__uuidof(IAudioRenderClient), (void**)&ren);
         if (FAILED(hr)) ENG_FAIL("GetService render");
 
-        const UINT32 low = TARGET - slack, high = TARGET + slack;
+        // Adaptief bufferdoel. Hoeveel frames we in de renderbuffer willen
+        // houden hangt af van het endpoint: de analoge uitgang haalt hetzelfde
+        // tempo als de capture, maar S/PDIF pulst grover en wil meer voorraad.
+        // Daarom: start ruim, krimp na een lange schone periode, en groei
+        // meteen terug zodra de buffer bijna leegloopt. Zo krijgt elk device
+        // de laagste latency die het zonder underruns volhoudt.
+        const UINT32 tgtMin = sharedOut ? 1440 : 2 * capFrames;
+        UINT32 tgtMax = sharedOut ? 4800 : 16 * capFrames;
+        if (renFrames > 3 * capFrames && tgtMax > renFrames - 3 * capFrames)
+            tgtMax = renFrames - 3 * capFrames;
+        if (tgtMax < tgtMin) tgtMax = tgtMin;
+        UINT32 target = sharedOut ? tgtMin : 4 * capFrames;
+        if (target > tgtMax) target = tgtMax;
+        if (target < tgtMin) target = tgtMin;
+
         BYTE* pb = nullptr;
-        hr = ren->GetBuffer(TARGET, &pb);
+        hr = ren->GetBuffer(target, &pb);
         if (FAILED(hr)) ENG_FAIL("prime");
-        memset(pb, 0, (size_t)TARGET * 4);
-        ren->ReleaseBuffer(TARGET, 0);
+        memset(pb, 0, (size_t)target * 4);
+        ren->ReleaseBuffer(target, 0);
 
         DWORD mmIdx = 0;
         mm = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmIdx);
+        // zonder expliciete prioriteit blijft de thread op de laagste
+        // Pro Audio-trap: dat kost late wakeups en dus underruns
+        if (mm) AvSetMmThreadPriority(mm, AVRT_PRIORITY_CRITICAL);
 
         std::vector<double> dIn(MAXBLOCK), dOut(MAXBLOCK);
         std::vector<float> fOut(MAXBLOCK);
@@ -564,7 +609,43 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
         const float fadeOut = 1.0f / (0.1f * SR);
         bool fadingOut = false;
 
+        // Niveaukalibratie. input_level_dbu zegt welk dBu-niveau bij de
+        // opname op 0 dBFS stond; het verschil met onze eigen interface is
+        // precies de trim die de amp op zijn bedoelde werkpunt zet.
+        // loudness zegt hoe hard het model uitkomt bij die drive, en haalt
+        // het volumeverschil tussen modellen eruit (doel -18 dB, als in NAM).
+        float inTrim = 1.0f, outNorm = 1.0f;
+        const double NORM_TARGET_DB = -18.0;
+        auto recalcCal = [&]() {
+            float t = 1.0f, o = 1.0f, mdl = 0.0f;
+            bool has = false;
+            if (model) {
+                if (model->HasInputLevel()) {
+                    mdl = (float)model->GetInputLevel();
+                    has = true;
+                } else {
+                    mdl = g.calAssumeDbu.load();
+                }
+                if (g.calOn.load())
+                    t = powf(10.0f, (g.calDbu.load() - mdl) / 20.0f);
+                if (g.normOn.load() && model->HasLoudness())
+                    o = powf(10.0f, (float)((NORM_TARGET_DB -
+                                             model->GetLoudness()) / 20.0));
+            }
+            inTrim = t;
+            outNorm = o;
+            g.modelInDbu.store(mdl);
+            g.modelHasCal.store(has);
+            g.trimDb.store(20.0f * log10f(t));
+            g.normDb.store(20.0f * log10f(o));
+        };
+        recalcCal();
+
         long wakeups = 0;
+        // venster voor het bijstellen van het bufferdoel (~1 s)
+        UINT32 winMinPad = 0xFFFFFFFFu;
+        long winUnder = 0, winN = 0, cleanWins = 0;
+        const long winBlocks = SR / (long)capFrames;
         double padAcc = 0.0, dspAcc = 0.0;
         long accN = 0;
         double dspMax = 0.0;
@@ -655,6 +736,7 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
                     g.modelSR.store(model->GetExpectedSampleRate());
                     dcX1 = dcY1 = 0.0;
                     fadeEnv = 0.0f;  // korte fade-in voor het nieuwe model
+                    recalcCal();     // ander model = ander werkpunt
                     nam::DSP* prev = g.retiredModel.exchange(old);
                     if (prev) delete prev;  // zeldzame fallback bij snel wisselen
                 }
@@ -692,10 +774,18 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
                                                       : track->frames;
             }
 
+            if (g.calDirty.exchange(false)) recalcCal();
+
             QueryPerformanceCounter(&dspA);
+            // kalibratie-trim: brengt ons signaal op het niveau waarop dit
+            // model is opgenomen, zodat de amp net zo hard wordt aangestuurd
+            if (inTrim != 1.0f)
+                for (UINT32 i = 0; i < total; i++) dIn[i] *= inTrim;
             double* ip = dIn.data();
             double* op = dOut.data();
             model->process(&ip, &op, (int)total);
+            if (outNorm != 1.0f)
+                for (UINT32 i = 0; i < total; i++) dOut[i] *= outNorm;
             // cabinet-IR: contiguÃ« convolutie (taps omgekeerd opgeslagen)
             if (ir) {
                 const size_t nt = ir->taps.size();
@@ -767,21 +857,54 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
                     padAcc = dspAcc = 0.0;
                     accN = 0;
                 }
+                // doel bijstellen op het diepste punt van het laatste seconde:
+                // krap geworden -> meteen een periode erbij; al tien seconden
+                // ruim -> voorzichtig een periode eraf
+                if (padding < winMinPad) winMinPad = padding;
+                if (padding == 0) winUnder++;
+                if (++winN >= winBlocks) {
+                    if (winUnder > 0 || winMinPad < 2 * capFrames) {
+                        if (target + capFrames <= tgtMax) target += capFrames;
+                        cleanWins = 0;
+                    } else if (winMinPad + capFrames > target &&
+                               ++cleanWins >= 10) {
+                        if (target >= tgtMin + capFrames) target -= capFrames;
+                        cleanWins = 0;
+                    }
+                    g.targetFrames.store((int)target);
+                    winMinPad = 0xFFFFFFFFu;
+                    winUnder = 0;
+                    winN = 0;
+                }
             }
 
-            UINT32 writeOfs = 0, writeN = total;
-            if (padding > high && writeN > 0) {
-                UINT32 drop = padding - TARGET;
+            // Bufferregeling. De klok van de kabel en die van het endpoint
+            // lopen ~40 ppm uit elkaar; dat is ~2 frames per seconde, en bij
+            // 333 blokken/s is 1 frame per blok dus ruim genoeg om bij te
+            // sturen. Eén losse frame invoegen of overslaan hoor je niet;
+            // de brokken van honderden frames die hier eerst werden ingevuld
+            // wel. Alleen bij grote uitschieters grijpen we hard in.
+            const int err = (int)padding - (int)target;
+            const int dead = (int)capFrames / 8;
+            UINT32 writeOfs = 0, writeN = total, fill = 0;
+            if (err > (int)(4 * capFrames) && writeN > 0) {
+                UINT32 drop = (UINT32)err;          // ver boven doel: dumpen
                 if (drop > writeN) drop = writeN;
                 writeOfs = drop;
                 writeN -= drop;
                 if (warm) g.driftCorr += (long)drop;
-            }
-            UINT32 pad2 = padding + writeN;
-            UINT32 fill = 0;
-            if (pad2 < low) {
-                fill = low - pad2;
+            } else if (padding + writeN < 2 * capFrames &&
+                       (int)target > (int)(padding + writeN)) {
+                // dreigt leeg te lopen vóór de volgende wakeup: nu bijvullen
+                fill = target - (padding + writeN);
                 if (warm) g.driftCorr += (long)fill;
+            } else if (err > dead && writeN > 0) {
+                writeOfs = 1;                       // 1 frame overslaan
+                writeN -= 1;
+                if (warm) g.driftCorr++;
+            } else if (err < -dead) {
+                fill = 1;                           // 1 frame aanhouden
+                if (warm) g.driftCorr++;
             }
             UINT32 n = writeN + fill;
             if (n > renFrames - padding) n = renFrames - padding;
@@ -830,8 +953,13 @@ static void engineMain(std::wstring modelPath, std::wstring outDevId,
                 sysPrimed = false;
             }
             const uint32_t SMASK = EngineShared::SRING - 1;
+            // opvulframes naar nul laten lopen i.p.v. de laatste sample
+            // vasthouden: een DC-blok van honderden frames klikt hoorbaar
+            const float fillFade = fill > 1 ? 1.0f / (float)fill : 0.0f;
             for (UINT32 i = 0; i < n; i++) {
-                float gv = i < writeN ? fOut[writeOfs + i] : lastS;
+                float gv = i < writeN
+                               ? fOut[writeOfs + i]
+                               : lastS * (1.0f - (i - writeN) * fillFade);
                 float L = gv, R = gv;
                 if (tPlay && tpos < tFrames) {
                     L += tp[tpos * 2] * tVol;
@@ -939,6 +1067,7 @@ static void startEngine(const std::wstring& modelPath,
     g.driftCorr = 0;
     g.lateWakeups = 0;
     g.dspMaxUs = 0;
+    g.targetFrames = 0;
     gEngineThread = std::thread(engineMain, modelPath, outDevId,
                                 renderDelayMs);
 }
@@ -1247,6 +1376,90 @@ static void sysRestoreEndpointState() {
     gSysVolSaved = false;
 }
 
+// --- herstel na crash/kill -------------------------------------------------
+// Zolang systeemaudio actief is, staat de originele toestand (default-device,
+// volume/mute van het muziek-endpoint) in sys_restore.json. Bij een nette stop
+// wordt het bestand verwijderd; staat het er bij de volgende start nog, dan is
+// de app niet netjes afgesloten en zetten we alles alsnog terug.
+static fs::path gSysRestoreFile;
+static std::string narrowId(const std::wstring& w) {
+    return std::string(w.begin(), w.end());  // device-IDs zijn ASCII
+}
+static void sysRestoreFileWrite() {
+    if (gSysRestoreFile.empty()) return;
+    nlohmann::json j = {{"dev", narrowId(gSysDevId)},
+                        {"prev_default", narrowId(gSysPrevDefault)},
+                        {"switched", gSysSwitchedDefault},
+                        {"vol_saved", gSysVolSaved},
+                        {"vol", gSysPrevVol},
+                        {"mute", gSysPrevMute != FALSE}};
+    FILE* f = _wfopen(gSysRestoreFile.wstring().c_str(), L"wb");
+    if (!f) return;
+    std::string out = j.dump(2);
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
+}
+static void sysRestoreFileClear() {
+    if (gSysRestoreFile.empty()) return;
+    DeleteFileW(gSysRestoreFile.wstring().c_str());
+}
+// Bij opstarten: herstelt wat een vorige (afgebroken) sessie heeft veranderd.
+// Retourneert true als er iets hersteld is.
+static bool sysRecoverFromFile() {
+    if (gSysRestoreFile.empty()) return false;
+    FILE* f = _wfopen(gSysRestoreFile.wstring().c_str(), L"rb");
+    if (!f) return false;
+    std::string s;
+    char buf[1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+    fclose(f);
+    bool did = false;
+    try {
+        auto j = nlohmann::json::parse(s);
+        std::string devA = j.value("dev", "");
+        std::string prevA = j.value("prev_default", "");
+        std::wstring dev(devA.begin(), devA.end());
+        std::wstring prev(prevA.begin(), prevA.end());
+        // volume/mute van het muziek-endpoint terug
+        if (j.value("vol_saved", false) && !dev.empty()) {
+            IMMDeviceEnumerator* enu = nullptr;
+            if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator),
+                                           nullptr, CLSCTX_ALL,
+                                           __uuidof(IMMDeviceEnumerator),
+                                           (void**)&enu))) {
+                IMMDevice* d = nullptr;
+                if (SUCCEEDED(enu->GetDevice(dev.c_str(), &d))) {
+                    IAudioEndpointVolume* v = nullptr;
+                    if (SUCCEEDED(d->Activate(__uuidof(IAudioEndpointVolume),
+                                              CLSCTX_ALL, nullptr,
+                                              (void**)&v))) {
+                        if (j.contains("vol") && j["vol"].is_number()) {
+                            float vol = j["vol"].get<float>();
+                            if (vol >= 0.0f && vol <= 1.0f)
+                                v->SetMasterVolumeLevelScalar(vol, nullptr);
+                        }
+                        v->SetMute(j.value("mute", false) ? TRUE : FALSE,
+                                   nullptr);
+                        v->Release();
+                        did = true;
+                    }
+                    d->Release();
+                }
+                enu->Release();
+            }
+        }
+        // default-device terug, maar alleen als het nog op ons
+        // muziek-endpoint staat (de gebruiker kan het al zelf hebben gewijzigd)
+        if (j.value("switched", false) && !prev.empty() &&
+            getDefaultRenderId() == dev) {
+            if (SUCCEEDED(setDefaultEndpoint(prev))) did = true;
+        }
+    } catch (...) {}
+    sysRestoreFileClear();
+    return did;
+}
+
 // UI-thread: capture starten + default-device en mute-status omzetten
 static void startSysAudio(const std::wstring& devId) {
     if (gSysThread.joinable()) return;
@@ -1264,6 +1477,7 @@ static void startSysAudio(const std::wstring& devId) {
                            "handmatig op het muziek-endpoint");
     }
     sysSaveAndMuteEndpoint(devId);
+    sysRestoreFileWrite();
     gSysStop.store(false);
     gSysDone.store(false);
     gSysThread = std::thread(sysCaptureMain, devId);
@@ -1280,6 +1494,7 @@ static void stopSysAudio() {
         setDefaultEndpoint(gSysPrevDefault);
     gSysSwitchedDefault = false;
     gSysDone.store(false);
+    sysRestoreFileClear();
 }
 
 // ander muziek-endpoint kiezen TERWIJL systeemaudio actief is. Belangrijk:
@@ -1301,6 +1516,7 @@ static void retargetSysAudio(const std::wstring& newId) {
     g.setSysStatus("");
     g.sysCapPeak.store(0.0f);
     sysSaveAndMuteEndpoint(newId);
+    sysRestoreFileWrite();
     gSysStop.store(false);
     gSysDone.store(false);
     gSysThread = std::thread(sysCaptureMain, newId);
@@ -2957,6 +3173,11 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam,
                 createRTV();
             }
             return 0;
+        case WM_ENDSESSION:
+            // Windows sluit af of logt uit: we krijgen geen normale
+            // afsluitroute meer, dus systeemaudio hier al terugzetten
+            if (wParam) stopSysAudio();
+            return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -3045,6 +3266,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
 
     float uiPeakIn = 0.0f, uiPeakOut = 0.0f;
     float gainUI = 1.0f, masterUI = 0.5f;
+    float calDbuUI = 8.0f;
+    bool calOnUI = true, normOnUI = true;
     float trackVolUI = 0.7f;
     float sysVolUI = 0.7f;
     bool sysEnabledUI = false;   // intentie "Windows-audio meespelen" (persistent)
@@ -3113,6 +3336,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
     int selOut = -1;  // -1 = automatisch (Realtek Digital)
     std::set<std::string> favorites;  // bestandsnamen (.nam)
     fs::path settingsFile = modelsDir.parent_path() / L"settings.json";
+    gSysRestoreFile = modelsDir.parent_path() / L"sys_restore.json";
+    bool recoveredSys = sysRecoverFromFile();  // vorige run niet netjes gestopt?
     {
         FILE* f = _wfopen(settingsFile.wstring().c_str(), L"rb");
         if (f) {
@@ -3142,10 +3367,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                 sysDevId.assign(sysDev.begin(), sysDev.end());
                 sysVolUI = j.value("sys_volume", 0.7f);
                 sysEnabledUI = j.value("sys_enabled", false);
+                calDbuUI = j.value("cal_dbu", 8.0f);
+                calOnUI = j.value("cal_on", true);
+                normOnUI = j.value("norm_on", true);
             } catch (...) {}
         }
     }
     g.sysVol.store(sysVolUI);
+    g.calDbu.store(calDbuUI);
+    g.calOn.store(calOnUI);
+    g.normOn.store(normOnUI);
+    g.calDirty.store(true);
+    if (recoveredSys)
+        g.setSysStatus("vorige keer niet netjes afgesloten: default-device "
+                       "en mute van het muziek-endpoint zijn hersteld");
     if (selIr >= 0) loadIrAsync(irs[selIr].path);  // klaarzetten voor start
 
     // sorteert modellen en IR's volgens librarySort; selecties blijven kloppen
@@ -3206,7 +3441,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                             {"tuning", tuning},
                             {"sys_device_id", sysId},
                             {"sys_volume", sysVolUI},
-                            {"sys_enabled", sysEnabledUI}};
+                            {"sys_enabled", sysEnabledUI},
+                            {"cal_dbu", calDbuUI},
+                            {"cal_on", calOnUI},
+                            {"norm_on", normOnUI}};
         FILE* f = _wfopen(settingsFile.wstring().c_str(), L"wb");
         if (f) {
             std::string s = j.dump(2);
@@ -3996,6 +4234,49 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
                 g.eqMid.store(eqMidUI);
                 g.eqTreble.store(eqTrebleUI);
                 g.eqDirty.store(true);
+            }
+            // --- niveaukalibratie ---
+            ImGui::SameLine();
+            ImGui::Dummy(ImVec2(18, 0));
+            ImGui::SameLine();
+            {
+                ImGui::BeginGroup();
+                ImGui::TextDisabled("Kalibratie \xe2\x80\x94 input dBu bij 0 dBFS");
+                ImGui::SetNextItemWidth(150);
+                if (ImGui::SliderFloat("##caldbu", &calDbuUI, -6.0f, 24.0f,
+                                       "%.1f dBu")) {
+                    g.calDbu.store(calDbuUI);
+                    g.calDirty.store(true);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) saveSettings();
+                ImGui::SameLine();
+                if (ImGui::Checkbox("aan##calon", &calOnUI)) {
+                    g.calOn.store(calOnUI);
+                    g.calDirty.store(true);
+                    saveSettings();
+                }
+                ImGui::SameLine();
+                if (ImGui::Checkbox("volume gelijk##normon", &normOnUI)) {
+                    g.normOn.store(normOnUI);
+                    g.calDirty.store(true);
+                    saveSettings();
+                }
+                if (g.running.load()) {
+                    float mdl = g.modelInDbu.load();
+                    if (g.modelHasCal.load())
+                        ImGui::TextDisabled(
+                            "model: %.1f dBu \xe2\x86\x92 %+.1f dB in, "
+                            "%+.1f dB uit",
+                            mdl, g.trimDb.load(), g.normDb.load());
+                    else
+                        ImGui::TextDisabled(
+                            "model geeft geen niveau \xe2\x80\x94 aanname "
+                            "%.1f dBu \xe2\x86\x92 %+.1f dB in, %+.1f dB uit",
+                            mdl, g.trimDb.load(), g.normDb.load());
+                } else {
+                    ImGui::TextDisabled("(start de engine voor de waarden)");
+                }
+                ImGui::EndGroup();
             }
         }
 
@@ -5101,8 +5382,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmd, int) {
         // --- statusregel onderaan ---
         if (running) {
             double padMs = g.padAvgFrames.load() * 1000.0 / SR;
-            ImGui::Text("latency: %.1f ms software (3.0 in + %.1f uit)",
-                        3.0 + padMs, padMs);
+            double tgtMs = g.targetFrames.load() * 1000.0 / SR;
+            ImGui::Text("latency: %.1f ms software (3.0 in + %.1f uit, "
+                        "doel %.1f)",
+                        3.0 + padMs, padMs, tgtMs);
             ImGui::Text("NAM: %.2f ms/blok (max %.2f)  |  underruns: %ld  |  "
                         "driftcorrectie: %ld frames  |  late wakeups: %ld  |  "
                         "wakeups: %ld",

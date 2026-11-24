@@ -11,6 +11,8 @@ t3k.json
 # persoonlijke instellingen en presets
 settings.json
 presets.json
+# hersteltoestand systeemaudio (alleen aanwezig tijdens een sessie)
+sys_restore.json
 # gedownloade community-content (eigen licenties, niet herdistribueren)
 models/
 irs/
